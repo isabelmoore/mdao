@@ -1,3 +1,7 @@
+Fz_err   = self.mass*9.81 - F_lift*np.cos(bank_meas)
+alpha_cmd = alpha_prev + k_F * Fz_err + alpha_ff    # k_F  [rad / N]
+alpha_cmd = np.clip(alpha_cmd, α_min, α_max)
+
 # trajectory_dqn_training.py
 """End‑to‑end DQN example for a trajectory‑planning task with **discrete**
 (alpha, bank) commands.
