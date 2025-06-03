@@ -126,33 +126,61 @@ class TrajectoryEnv(gym.Env):
         self.prev_states[0] = self.pose
         self.prev_inputs[0] = self.actions
 
-    def compute_inputs(self):
-        # --- fetch current state once ---
-        V     = self.problem.get_val('traj.phase0.timeseries.vel')[-1]
-        h     = self.problem.get_val('traj.phase0.timeseries.height')[-1]
-        hdot  = self.problem.get_val('traj.phase0.timeseries.hdot')[-1]
-        psi   = self.problem.get_val('traj.phase0.timeseries.heading')[-1]
-    
-        # 1) altitude → γ_cmd
-        h_err = self.desired_height - h
-        gamma_cmd = kp_h * h_err - ki_h * hdot
-        gamma_cmd = np.clip(gamma_cmd, -gamma_max, gamma_max)
-    
-        # 2) heading → bank_cmd
-        psi_err    = np.arctan2(np.sin(self.desired_heading - psi),
-                                np.cos(self.desired_heading - psi))
-        psi_dot_cmd = kp_psi * psi_err
-        bank_cmd    = np.arctan2(V * psi_dot_cmd, 9.81)
-        bank_cmd    = np.clip(bank_cmd, bank_min, bank_max)
-    
-        # 3) γ_cmd → α_cmd via trimmed-lift plus small P term
-        CL_req   = self.mass * 9.81 * np.cos(bank_cmd) / (0.5 * self.rho * V**2 * self.S)
-        alpha_trim = alpha_0 + (CL_req - CL_0) / CL_alpha
-        gamma_meas = np.arcsin(hdot / V)
-        alpha_cmd  = alpha_trim + kp_gamma * (gamma_cmd - gamma_meas)
-        alpha_cmd  = np.clip(alpha_cmd, alpha_min, alpha_max)
-    
-        return alpha_cmd, bank_cmd
+import numpy as np
+
+# ------------------------------------------------------------------
+# helper: scale [-1,1] → [lo, hi]
+def denorm(val_norm, lo, hi):
+    return lo + 0.5 * (val_norm + 1.0) * (hi - lo)
+
+
+# ------------------------------------------------------------------
+def compute_inputs(self, action):
+    """
+    Agent's action = [α_ff_norm, ϕ_ff_norm, k_p_h_norm, k_p_ψ_norm]
+    Returns (alpha_cmd, bank_cmd) in *radians*.
+    """
+    # --------------- 1. decode RL action --------------------------
+    alpha_ff = denorm(action[0], self.alpha_min, self.alpha_max)
+    bank_ff  = denorm(action[1], self.bank_min,  self.bank_max)
+
+    kp_h   = denorm(action[2], 0.0, self.kp_h_max)
+    kp_psi = denorm(action[3], 0.0, self.kp_psi_max)
+
+    # --------------- 2. grab current state ------------------------
+    V     = self.problem.get_val('traj.phase0.timeseries.vel')[-1]          # m/s
+    h     = self.problem.get_val('traj.phase0.timeseries.height')[-1]       # m
+    hdot  = self.problem.get_val('traj.phase0.timeseries.hdot')[-1]         # m/s
+    psi   = self.problem.get_val('traj.phase0.timeseries.heading')[-1]      # rad
+    r_meas = self.problem.get_val('traj.phase0.timeseries.r')[-1]           # yaw-rate rad/s
+
+    # --------------- 3. outer altitude loop -----------------------
+    h_err      = self.desired_height - h
+    gamma_cmd  = kp_h * h_err - self.ki_h * hdot
+    gamma_cmd  = np.clip(gamma_cmd, -self.gamma_max, self.gamma_max)
+
+    # --------------- 4. heading → desired yaw-rate ----------------
+    psi_err     = np.arctan2(np.sin(self.desired_heading - psi),
+                             np.cos(self.desired_heading - psi))
+    psi_dot_cmd = kp_psi * psi_err
+    psi_dot_cmd = np.clip(psi_dot_cmd, -self.psi_dot_max, self.psi_dot_max)
+
+    # --------------- 5. map γ_cmd → α_cmd (lift inversion) --------
+    rho   = self.rho                      # kg/m³  (constant or ISA lookup)
+    W     = self.mass * 9.81
+    CL_req = W / (0.5 * rho * V**2 * self.S)          # no cosϕ; body-lift
+    alpha_trim = self.alpha_0 + (CL_req - self.CL_0) / self.CL_alpha
+
+    gamma_meas = np.arcsin(np.clip(hdot / max(V, 1e-3), -1.0, 1.0))
+    alpha_cmd  = alpha_trim + self.kp_gamma * (gamma_cmd - gamma_meas) + alpha_ff
+    alpha_cmd  = np.clip(alpha_cmd, self.alpha_min, self.alpha_max)
+
+    # --------------- 6. yaw-rate → rudder / fin deflection --------
+    bank_cmd = self.rudder_gain * (psi_dot_cmd - r_meas) + bank_ff
+    bank_cmd = np.clip(bank_cmd, self.bank_min, self.bank_max)
+
+    # --------------- 7. done --------------------------------------
+    return float(alpha_cmd), float(bank_cmd)
 
     # ------------------------------------------------------------------
     # Gym API
