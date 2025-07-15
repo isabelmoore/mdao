@@ -21,6 +21,7 @@ import matplotlib.pyplot as plt
 import pickle
 import torch.nn.functional as F
 from matplotlib.colors import Normalize
+from datetime import datetime
 
 
 
@@ -67,17 +68,15 @@ def prepare_df(db_filename):
 
 
     X_train_df = pd.merge(results_df, aggregated_df, on='case_num')
+
+
     return X_train_df
 
 
 # Data preparation function
-def prepare_data(db_filename):
+def prepare_data(db_filename, save_new_dataset):
     X_train_df = prepare_df(db_filename)
 
-    # print(X_train_df)
-    # print(X_train_df.columns)
-
-    # Stack features: azimuth and range, both should have length 240
     X = torch.stack((
         torch.tensor(X_train_df['azimuth'], dtype=torch.float32),
         torch.tensor(X_train_df['range'], dtype=torch.float32)
@@ -89,7 +88,7 @@ def prepare_data(db_filename):
         torch.tensor(X_train_df['bank_list'], dtype=torch.float32)
     ), dim=1)
 
-    num_cases = len(results_df['case_num'])
+    num_cases = len(X_train_df['case_num'])
     shuffled_indices = np.random.permutation(num_cases)
     split_index = int(0.9 * num_cases)
     
@@ -101,7 +100,6 @@ def prepare_data(db_filename):
     scaler_y = StandardScaler()
     y_scaled = scaler_y.fit_transform(y.reshape(-1, y.shape[-1])).reshape(y.shape) # 3D shaping
 
-    # Create scaled training and testing sets
     X_train = X_scaled[train_indices]
     y_train = y_scaled[train_indices]
     X_test = X_scaled[test_indices]
@@ -111,35 +109,29 @@ def prepare_data(db_filename):
     print(f'X_train shape: {X_train.shape}, y_train shape: {y_train.shape}')
     print(f'X_test shape: {X_test.shape}, y_test shape: {y_test.shape}')
 
-
-    # Save the datasets and scalers
-    data_to_save = (X_train, X_test, y_train, y_test, scaler_x, scaler_y)
-    with open('data.pkl', 'wb') as f:
-        pickle.dump(data_to_save, f)
+    if save_new_dataset:
+        data_to_save = (X_train, X_test, y_train, y_test, scaler_x, scaler_y)
+        with open('data.pkl', 'wb') as f:
+            pickle.dump(data_to_save, f)
 
     return X_train, X_test, y_train, y_test, scaler_x, scaler_y
 
 
 def train_model(X_train, X_test, y_train, y_test, model,
-                input_size, output_size, num_epochs, device, batch_size=256, patience=500, l1_lambda=0.01):
+                input_size, output_size, num_epochs, device, batch_size, patience, l1_lambda, learning_rate):
     criterion = nn.MSELoss()
-    learning_rate = 1e-4
+    
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
 
-    model.train()
     starttime = time.time()
     train_losses, test_losses = [], []
 
     best_test_loss = float('inf')  
     epochs_without_improvement = 0  
 
-    # Initialize hidden and memory states
-    hidden_size = 128   # Should match the LSTM configuration
-    num_layers = 1      # Number of LSTM layers
-    # Initialize to zeros
-    hidden = torch.zeros(num_layers, batch_size, hidden_size).to(device) 
-    memory = torch.zeros(num_layers, batch_size, hidden_size).to(device)
     for epoch in range(num_epochs):
+        model.train()
+
         try:
             indices = torch.randperm(X_train.size(0)).to(device)
 
@@ -148,12 +140,19 @@ def train_model(X_train, X_test, y_train, y_test, model,
                 batch_indices = indices[i:i + batch_size]
                 batch_X = X_train[batch_indices]  
                 batch_y = y_train[batch_indices] 
+                
+                outputs = model(batch_X)
+                outputs = outputs.view(-1, 2, 120)  # reshape to (batch_size, 2, 120)
+                print("Training Output Shape:", outputs.shape)
     
-                outputs, hidden, memory = model(batch_X, hidden, memory)                
-                # outputs = outputs.view(-1, 2, 120) 
                 # train_acc += (outputs.argmax(1) == labels).sum().item()
                 training_loss = criterion(outputs, batch_y)
-
+                # # Calculate L1 penalty
+                # l1_norm = sum(p.abs().sum() for p in model.parameters())
+                # l1_loss = l1_lambda * l1_norm
+                
+                # # Total loss
+                # training_loss += l1_loss
                 # Backward pass
                 optimizer.zero_grad()
                 training_loss.backward()
@@ -218,7 +217,7 @@ class FlexibleNeuralNet(nn.Module):
             # add drop out layers but not after input layer
             if i != 0:
                 self.layers.append(nn.Dropout(p=0.5))
-
+            
         # add ouput layer
         self.layers.append(nn.Linear(layer_sizes[-2], layer_sizes[-1]))
 
@@ -228,69 +227,91 @@ class FlexibleNeuralNet(nn.Module):
             self.activations.append(x)  
         return x
 
-class ResBlockMLP(nn.Module):
-    def __init__(self, input_size, output_size):
-        super(ResBlockMLP, self).__init__()
-        self.norm1 = nn.LayerNorm(input_size)
-        self.fc1 = nn.Linear(input_size, input_size // 2)
-        self.norm2 = nn.LayerNorm(input_size // 2)
-        self.fc2 = nn.Linear(input_size // 2, output_size)
-        self.fc3 = nn.Linear(input_size, output_size)
-        self.act = nn.ELU()
+class LSTMModel(nn.Module):
+    def __init__(self, input_size, hidden_size, num_layers, output_size, dropout_rate=0.5):
+        super(LSTMModel, self).__init__()
+        
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, dropout=dropout_rate if num_layers > 1 else 0)
+        self.dropout = nn.Dropout(p=dropout_rate) 
+        self.fc = nn.Linear(hidden_size, output_size)
+        self.activations = []
 
     def forward(self, x):
-        x = self.act(self.norm1(x))
-        skip = self.fc3(x)
-        x = self.act(self.norm2(self.fc1(x)))
-        x = self.fc2(x)
-        return x + skip
+        print("LSTM input shape:", x.shape)  # Debug: Check input shape
 
-class LSTM(nn.Module):
-    def __init__(self, seq_len, num_features, output_size, num_blocks=1):
-        super(LSTM, self).__init__()
-        self.input_mlp = nn.Sequential(
-            nn.Linear(seq_len * num_features, 4 * seq_len * num_features),  # Corrected initialization
-            nn.ELU(),
-            nn.Linear(4 * seq_len * num_features, 128)  # Output size for MLP
-        )
+        lstm_out, _ = self.lstm(x)  
+        print("LSTM output shape:", lstm_out.shape)  # Debug: Check LSTM output shape
+        self.activations.append(lstm_out.detach().cpu())  
+
+        if lstm_out.dim() == 3:  
+            last_time_step = lstm_out[:, -1, :]  
+        elif lstm_out.dim() == 2:  
+            last_time_step = lstm_out  
+        else:
+            raise ValueError("Unexpected output shape from LSTM")
         
-        # Create LSTM block
-        self.lstm = nn.LSTM(input_size=128, hidden_size=128, num_layers=1, batch_first=True)
-        
-        # Residual blocks
-        blocks = [ResBlockMLP(128, 128) for _ in range(num_blocks)]
-        self.res_blocks = nn.Sequential(*blocks)
+        last_time_step = self.dropout(last_time_step)  
+        output = self.fc(last_time_step)  
+        return output
 
-        # Output layer
-        self.fc_out = nn.Linear(128, output_size)
 
-    def forward(self, input_seq, hidden_in, mem_in):
-        # Reshape the input sequence for the MLP
-        input_vec = self.input_mlp(input_seq.view(input_seq.size(0), -1))  # Reshape to [batch_size, seq_len*num_features]
-        input_vec = input_vec.unsqueeze(1)  # Shape: [batch_size, 1, 128] for LSTM
+def predicting(azimuth, range_, scaler_x, scaler_y):
+    try:
+        input_tensor = np.array([[azimuth, range_]], dtype=np.float32)
+    except:
+        input_tensor = torch.tensor([[azimuth, range_]], dtype=torch.float32).cpu().numpy()
 
-        # Pass through LSTM
-        output, (hidden_out, mem_out) = self.lstm(input_vec, (hidden_in, mem_in))
+    input_tensor_scaled = scaler_x.transform(input_tensor)
 
-        # Process last time step output through residual blocks
-        x = output[:, -1, :]  # Taking the last time step output
-        x = self.res_blocks(x)  # Residual blocks
+    input_tensor_scaled = torch.tensor(input_tensor_scaled, dtype=torch.float32).to(device)
+    input_tensor_scaled = input_tensor_scaled.squeeze(1)  
+    
+    with torch.no_grad():
+        output = model(input_tensor_scaled)
+        predicted_values = output.view(-1, 2, 120)  
+        predicted_values = predicted_values.squeeze(0).cpu()  
+        predicted_values = scaler_y.inverse_transform(predicted_values.numpy())  
 
-        # Output fully connected layer
-        return self.fc_out(x), hidden_out, mem_out
+    return predicted_values[0], predicted_values[1], 
+
 if __name__ == "__main__":
-    #### Set up argument parser ####
-    # # parser = argparse.ArgumentParser()
-    # # parser.add_argument("-e", "--epochs", required=True, type=int, help="number of epochs")
+
+    ###### Set Argument Parser ######
+    # parser = argparse.ArgumentParser()
+    # parser.add_argument("-e", "--epochs", required=True, type=int, help="number of epochs")
     
     # args = parser.parse_args()
     # num_epochs = args.epochs
     
+    ###### Set Parameters ######
+    input_size = 2  
+    hidden_size = 64  
+    num_layers = 3    
+    output_size = 240  
+
+
+    batch_size = 32
+    patience = 500
+    l1_lambda = 0.001
+    learning_rate = 1e-5
+    num_epochs = 1000
+
+    model_type = 'lstm' 
+
+    rerun_training = True
+    save_new_model = True
+ 
+    recreate_dataset = False # reshuffle?
+    save_new_dataset = False
+
     db_filename = '/home/imoore/misslemdao/trajectory_results_azimuth21_range51_cores30_date_2025_06_25_time_2035.db'
 
-    # X_train, X_test, y_train, y_test, scaler_x, scaler_y = prepare_data(db_filename)
-    with open('data.pkl', 'rb') as f:
-        X_train, X_test, y_train, y_test, scaler_x, scaler_y = pickle.load(f)
+
+    if recreate_dataset:
+        X_train, X_test, y_train, y_test, scaler_x, scaler_y = prepare_data(db_filename, save_new_dataset)
+    else:
+        with open('data.pkl', 'rb') as f:
+            X_train, X_test, y_train, y_test, scaler_x, scaler_y = pickle.load(f)
 
     device = torch.device(f"cuda:{LOCAL_RANK}" if torch.cuda.is_available() else "cpu")
     torch.cuda.set_device(device)
@@ -301,63 +322,69 @@ if __name__ == "__main__":
     X_test = torch.tensor(X_test, dtype=torch.float32).to(device)  
     y_test = torch.tensor(y_test, dtype=torch.float32).to(device) 
 
-    input_size = X_train.shape[1]
-    output_size = y_train.shape
 
-    layer_sizes = [2, 32, 64, 64, 240]  
+    print("X_Train Input Shape:", X_train.shape)
+    print("y_train Input Shape:", y_train.shape)
 
-    # model = FlexibleNeuralNet(layer_sizes=layer_sizes, activation_type='ReLU').to(device)
-    size_timeseries = 120
-    seq_len = 120  # Length of the time series (number of time steps)
-    num_features = 2  # Number of input features (parameters)
-    print("OUtput Size:", output_size)
-    output_size = y_train.shape[1]  # Number of outputs required (240 based on your original requirement)
+    if model_type == 'flex':
+        layer_sizes = [input_size] + [hidden_size] * num_layers + [output_size]
+        print(f"Layer Sizes: {layer_sizes}")
+        model = FlexibleNeuralNet(layer_sizes=layer_sizes, activation_type='ReLU').to(device)
+    if model_type == 'lstm':
+        model = LSTMModel(input_size, hidden_size, num_layers, output_size).to(device)
 
-    # Create the model
-    model = LSTM(seq_len=seq_len, num_features=num_features, output_size=output_size, num_blocks=2).to(device)
-    print(model)  # Print model architecture    
     model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
-    # model = model.to(device)
-    # model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[device], broadcast_buffers=False)
 
-    model, train_losses, test_losses = train_model(
-        X_train, X_test, y_train, y_test, 
-        model,
-        input_size=input_size, 
-        output_size=output_size, 
-        num_epochs=15_000, 
-        device=device
-    )
-    
-    # torch.save(model.state_dict(), 'trajectory_nn_model.pth')
-    # torch.distributed.destroy_process_group()
-    # model.load_state_dict(torch.load('trajectory_nn_model.pth'))
-    # torch.distributed.destroy_process_group()
+    if rerun_training: 
+        model, train_losses, test_losses = train_model(
+            X_train, X_test, y_train, y_test, 
+            model,
+            input_size=input_size, 
+            output_size=output_size, 
+            num_epochs=num_epochs, 
+            device=device,
+            batch_size=batch_size,
+            patience=patience,
+            l1_lambda=l1_lambda,
+            learning_rate=learning_rate
+        )
+        torch.distributed.destroy_process_group()
+
+    else:
+        torch.distributed.destroy_process_group()
+        model.load_state_dict(torch.load('trajectory_nn_model_2.pth'))
+        
+    if save_new_model:
+        torch.save(model.state_dict(), f'trajectory_nn_model_{model_type}_hs{hidden_size}_bs{batch_size}_l1{l1_lambda}_lr{learning_rate}.pth') # _date_{datetime.now().strftime("%Y_%m_%d")}_time_{datetime.now().strftime("%H%M")}
 
     model.eval()  
 
 
-    #### mse heat map global
+    '''
+    Plotting for Tuning
+    '''
+
+    ###### Loss vs Epochs Plot ######
+    if rerun_training:
+        plt.figure()
+        plt.plot(train_losses, label="Training Loss")
+        plt.plot(test_losses, label="Testing Loss")
+        plt.title("Loss over Epochs")
+        plt.xlabel("Epoch")
+        plt.ylabel("Loss")
+        plt.legend()
+        plt.grid(True)
+
+        plt.savefig('loss_plot.png')  
+        plt.close()  
+
+    ###### MSE Polar Plot #######
     X_df = prepare_df(db_filename)
     mse_values = []
     for index, row in X_df.iterrows():
         azimuth = row['azimuth']
         range_ = row['range']
-        input_tensor = np.array([[azimuth, range_]], dtype=np.float32)
-
-        input_tensor_scaled = scaler_x.transform(input_tensor)
-
-        input_tensor_scaled = torch.tensor(input_tensor_scaled, dtype=torch.float32).to(device)
-        input_tensor_scaled = input_tensor_scaled.squeeze(1)  
-        
-        with torch.no_grad():
-            output = model(input_tensor_scaled)
-            predicted_values = output.view(-1, 2, 120)  
-            predicted_values = predicted_values.squeeze(0).cpu()  
-            predicted_values = scaler_y.inverse_transform(predicted_values.numpy())  
-
-        predicted_alpha = predicted_values[0]  
-        predicted_bank = predicted_values[1] 
+        predicted_alpha, predicted_bank = predicting(azimuth, range_, scaler_x, scaler_y)
 
         actual_alpha = np.array(row['alpha_list'])[0]  
         actual_bank = np.array(row['bank_list'])[0]  
@@ -400,22 +427,20 @@ if __name__ == "__main__":
     plt.savefig("lar_alpha_bank.png")  
 
 
-    #### grid plotting ###
+    ###### MSE Grid Plot #######    
     alpha_mse_grid, azimuth_bins, range_bins = np.histogram2d(azimuths, ranges, bins=[30, 30], weights=alpha_mse_values)
     bank_mse_grid, _, _ = np.histogram2d(azimuths, ranges, bins=[30, 30], weights=bank_mse_values)
 
-    # Replace zero values with NaNs for masking
+    # replace zero values with NaNs for masking
     alpha_mse_grid = np.where(alpha_mse_grid == 0, np.nan, alpha_mse_grid)
     bank_mse_grid = np.where(bank_mse_grid == 0, np.nan, bank_mse_grid)
 
-    # Normalize the grids for proper color mapping (skip NaNs for min/max)
     alpha_norm = Normalize(vmin=np.nanmin(alpha_mse_grid), vmax=np.nanmax(alpha_mse_grid))
     bank_norm = Normalize(vmin=np.nanmin(bank_mse_grid), vmax=np.nanmax(bank_mse_grid))
 
-    # Create pixel plots using imshow
     plt.figure(figsize=(12, 6))
 
-    # First subplot for Alpha MSE
+    # subplot for Alpha MSE
     ax1 = plt.subplot(1, 2, 1)
     c1 = ax1.imshow(alpha_norm(alpha_mse_grid), aspect='auto', cmap='viridis',
                     extent=[np.min(azimuths), np.max(azimuths), np.min(ranges), np.max(ranges)],
@@ -425,7 +450,7 @@ if __name__ == "__main__":
     ax1.set_ylabel('Range')
     plt.colorbar(c1, ax=ax1, label='Alpha MSE')
 
-    # Second subplot for Bank MSE
+    # subplot for Bank MSE
     ax2 = plt.subplot(1, 2, 2)
     c2 = ax2.imshow(bank_norm(bank_mse_grid), aspect='auto', cmap='viridis',
                     extent=[np.min(azimuths), np.max(azimuths), np.min(ranges), np.max(ranges)],
@@ -435,93 +460,110 @@ if __name__ == "__main__":
     ax2.set_ylabel('Range')
     plt.colorbar(c2, ax=ax2, label='Bank MSE')
 
-    # Adjust layout and show plot
     plt.tight_layout()
     plt.savefig("grid_alpha_bank.png")  
 
 
+    ######  Activation Plot ######
+    if model_type == 'flex':
+        hidden_layer_indices = range(1, len(layer_sizes)-1) 
+        print(hidden_layer_indices)
 
-    # #### Loss Plot ####
-    # plt.figure()
-    # plt.plot(train_losses, label="Training Loss")
-    # plt.plot(test_losses, label="Testing Loss")
-    # plt.title("Loss over Epochs")
-    # plt.xlabel("Epoch")
-    # plt.ylabel("Loss")
-    # plt.legend()
-    # plt.grid(True)
+        plt.figure(figsize=(12, 12))  
 
-    # plt.savefig('loss_plot.png')  
-    # plt.close()  
+        for idx, i in enumerate(hidden_layer_indices):
+            activation = model.activations[i]  
+            ax = plt.subplot(len(hidden_layer_indices), 1, idx + 1)  
+            ax.imshow(activation.detach().cpu().numpy(), aspect='auto', cmap='hot')
+            ax.set_title(f'Activations of Hidden Layer {i} ({layer_sizes[i]} Features)')
+            ax.set_xlabel('Feature Index')
+            ax.set_ylabel('Sample Index')
+            plt.colorbar(ax.imshow(activation.detach().cpu().numpy(), aspect='auto', cmap='hot'), ax=ax, label='Activation Value')
 
-    ####  activation plotting
-    hidden_layer_indices = range(1, len(layer_sizes)-1) 
-    print(hidden_layer_indices)
+        plt.tight_layout()
 
-    plt.figure(figsize=(12, 12))  
+        plt.savefig('activations_hidden_layers.png')
+        plt.close()
 
-    for idx, i in enumerate(hidden_layer_indices):
-        activation = model.activations[i]  
-        ax = plt.subplot(len(hidden_layer_indices), 1, idx + 1)  
-        ax.imshow(activation.detach().cpu().numpy(), aspect='auto', cmap='hot')
-        ax.set_title(f'Activations of Hidden Layer {i} ({layer_sizes[i]} Features)')
-        ax.set_xlabel('Feature Index')
-        ax.set_ylabel('Sample Index')
-        plt.colorbar(ax.imshow(activation.detach().cpu().numpy(), aspect='auto', cmap='hot'), ax=ax, label='Activation Value')
+    if model_type == 'lstm':
+        '''
+        Activation References: https://www.mathworks.com/help/deeplearning/ug/visualize-features-of-lstm-network.html
+        '''
+        random_index = 6  
+        X = X_test[random_index] 
 
-    plt.tight_layout()
+        # each feature over time
+        plt.figure()
+        plt.plot(X.cpu().numpy().T)  
+        plt.xlabel("Time Step")
+        plt.title(f"Test Observation 1")
+        X = X_test[random_index].unsqueeze(0) 
+        if X.dim() == 1:
+            num_features = 1  
+        elif X.dim() == 2:
+            num_features = X.size(1)    
+        plt.legend([f"Feature {i+1}" for i in range(num_features)], loc='upper right')
+        plt.savefig('lstm_activations_features.png')
 
-    plt.savefig('activations_hidden_layers.png')
-    plt.close()
+
+        # Create heatmap for the first 10 hidden units (originally 64)
+        for i in range(X_test.shape[0]): 
+            output = model(X_test[i].unsqueeze(0))  
+
+        features = model.activations[0]  # for first input
+
+        plt.figure()
+        plt.imshow(features[:,:10], aspect='auto', cmap='hot')  
+        plt.title('LSTM Activations for the First Observation')
+        plt.xlabel('Time Step')
+        plt.ylabel('Hidden Unit Index')
+        plt.colorbar(label='Activation Value')
+        plt.savefig("lstm_activations_heatmap.png")
+        plt.close()
 
 
-    exit()
+    ###### actual vs predicted plots ######
+    index = 6
+    # Assume X_test is a tensor and you're accessing it by index
+    tensor_sample = X_test[index]
 
-    #### actual vs predicted plots 
-    random_index = 6
-    random_azimuth = X_test[random_index][0]
-    random_range = X_test[random_index][1]
+    # Move the tensor sample to CPU, converting it to a NumPy array
+    sample_np = tensor_sample.cpu().numpy()
 
-    actual_values = y_test[random_index].cpu().numpy()
+    # Inverse transform using the scaler
+    original_values = scaler_x.inverse_transform(sample_np.reshape(1, -1))  # Reshape to 2D array if necessary
+
+    # Extract the azimuth and range values based on your dataset structure
+    random_azimuth = original_values[0][0]  # First feature
+    random_range = original_values[0][1]    # Second feature
+
+    actual_values = y_test[index].cpu().numpy()
     actual_values = scaler_y.inverse_transform(actual_values)
 
-    selected_values_scaled = np.array([[random_azimuth.cpu().numpy(), random_range.cpu().numpy()]]) 
-    selected_values = scaler_x.inverse_transform(selected_values_scaled)
-    input_tensor = torch.tensor([[random_azimuth, random_range]], dtype=torch.float32).to(device)
-
-    with torch.no_grad():
-        output = model(input_tensor)
-
-        predicted_values = output.view(-1, 2, 120) 
-        predicted_values = predicted_values.squeeze(0) 
-        
-        predicted_values = predicted_values.cpu()  
-        predicted_values = scaler_y.inverse_transform(predicted_values.numpy())  
-
+    actual_azimuth, actual_bank = actual_values[0], actual_values[1]
+    predicted_alpha, predicted_bank = predicting(random_azimuth, random_range, scaler_x, scaler_y)
     x_axis = np.arange(120)
-
-    # In the training loop (after model predictions):
 
     # Create a figure and an array of subplots
     fig, axs = plt.subplots(2, 1, figsize=(10, 8))  # 2 rows, 1 column of subplots
 
     # First subplot for the first output
-    axs[0].plot(x_axis, actual_values[0], label='Actual', linestyle='-')
-    axs[0].plot(x_axis, predicted_values[0], label='Predicted', linestyle='-')
+    axs[0].plot(x_axis, actual_azimuth, label='Actual', linestyle='-')
+    axs[0].plot(x_axis, predicted_alpha, label='Predicted', linestyle='-')
 
     axs[0].set_title('Alpha')
     axs[0].legend()
     axs[0].grid(True)
 
     # Second subplot for the second output
-    axs[1].plot(x_axis, actual_values[1], label='Actual', linestyle='-')
-    axs[1].plot(x_axis, predicted_values[1], label='Predicted', linestyle='-')
+    axs[1].plot(x_axis, actual_bank, label='Actual', linestyle='-')
+    axs[1].plot(x_axis, predicted_bank, label='Predicted', linestyle='-')
     axs[1].set_title('Bank')
     axs[1].legend()
     axs[1].grid(True)
 
     # Adjust layout to prevent overlap
-    fig.suptitle(f'Comparison of Actual and Predicted Values\n(azimuth: {selected_values[0][0]}, range: {selected_values[0][1]}, index: {random_index})')
+    fig.suptitle(f'Comparison of Actual and Predicted Values\n(azimuth: {random_azimuth}, range: {random_range}, index: {index})')
     plt.tight_layout()
     plt.savefig('actual_vs_predicted_2.png')
     plt.close()  
@@ -536,16 +578,21 @@ if __name__ == "__main__":
 
     with torch.no_grad():
         for index in range(X_test.shape[0]):
-            input_tensor = torch.tensor([[X_test[index][0], X_test[index][1]]], dtype=torch.float32).to(device)
+            # Assume X_test is a tensor and you're accessing it by index
+            tensor_sample = X_test[index]
 
-            output = model(input_tensor) 
-            
-            predicted_values = output.view(-1, 2, 120)  
-            predicted_values = predicted_values.squeeze(0)  
-            
-            predicted_values = predicted_values.cpu().numpy()  
-            predicted_values = scaler_y.inverse_transform(predicted_values) 
-                
+            # Move the tensor sample to CPU, converting it to a NumPy array
+            sample_np = tensor_sample.cpu().numpy()
+
+            # Inverse transform using the scaler
+            original_values = scaler_x.inverse_transform(sample_np.reshape(1, -1))  # Reshape to 2D array if necessary
+
+            # Extract the azimuth and range values based on your dataset structure
+            random_azimuth = original_values[0][0]  # First feature
+            random_range = original_values[0][1]    # Second feature
+            predicted_alpha, predicted_bank = predicting(random_azimuth, random_range, scaler_x, scaler_y)
+            predicted_values = [predicted_alpha, predicted_bank]
+
             actual_values = y_test[index].cpu().numpy()
             actual_values = scaler_y.inverse_transform(actual_values)
             mse = np.mean((predicted_values - actual_values) ** 2)
