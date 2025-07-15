@@ -143,7 +143,7 @@ def train_model(X_train, X_test, y_train, y_test, model,
                 
                 outputs = model(batch_X)
                 outputs = outputs.view(-1, 2, 120)  # reshape to (batch_size, 2, 120)
-                print("Training Output Shape:", outputs.shape)
+                # print("Training Output Shape:", outputs.shape)
     
                 # train_acc += (outputs.argmax(1) == labels).sum().item()
                 training_loss = criterion(outputs, batch_y)
@@ -237,10 +237,10 @@ class LSTMModel(nn.Module):
         self.activations = []
 
     def forward(self, x):
-        print("LSTM input shape:", x.shape)  # Debug: Check input shape
+        # print("LSTM input shape:", x.shape)  # Debug: Check input shape
 
         lstm_out, _ = self.lstm(x)  
-        print("LSTM output shape:", lstm_out.shape)  # Debug: Check LSTM output shape
+        # print("LSTM output shape:", lstm_out.shape)  # Debug: Check LSTM output shape
         self.activations.append(lstm_out.detach().cpu())  
 
         if lstm_out.dim() == 3:  
@@ -294,7 +294,7 @@ if __name__ == "__main__":
     patience = 500
     l1_lambda = 0.001
     learning_rate = 1e-5
-    num_epochs = 1000
+    num_epochs = 300
 
     model_type = 'lstm' 
 
@@ -489,31 +489,22 @@ if __name__ == "__main__":
         '''
         Activation References: https://www.mathworks.com/help/deeplearning/ug/visualize-features-of-lstm-network.html
         '''
-        random_index = 6  
-        X = X_test[random_index] 
-
-        # each feature over time
-        plt.figure()
-        plt.plot(X.cpu().numpy().T)  
-        plt.xlabel("Time Step")
-        plt.title(f"Test Observation 1")
-        X = X_test[random_index].unsqueeze(0) 
-        if X.dim() == 1:
-            num_features = 1  
-        elif X.dim() == 2:
-            num_features = X.size(1)    
-        plt.legend([f"Feature {i+1}" for i in range(num_features)], loc='upper right')
-        plt.savefig('lstm_activations_features.png')
-
+        all_features = []
 
         # Create heatmap for the first 10 hidden units (originally 64)
         for i in range(X_test.shape[0]): 
             output = model(X_test[i].unsqueeze(0))  
 
-        features = model.activations[0]  # for first input
 
-        plt.figure()
-        plt.imshow(features[:,:10], aspect='auto', cmap='hot')  
+        # Collect the activations from the model
+        all_features.append(model.activations[0].cpu().numpy())  # Get activations for the current input and convert to CPU numpy array
+
+        # Convert all features to a single numpy array
+        all_features = np.array(all_features)
+
+        # Visualize LSTM activations for all hidden units
+        plt.figure(figsize=(12, 6))
+        plt.imshow(all_features.T, aspect='auto', cmap='hot')  # Transpose for time steps along the x-axis and hidden units along the y-axis
         plt.title('LSTM Activations for the First Observation')
         plt.xlabel('Time Step')
         plt.ylabel('Hidden Unit Index')
@@ -571,61 +562,7 @@ if __name__ == "__main__":
     exit()
 
 
-    mse_values = []
-    azimuth_values = []
-    range_values = []
-    model.eval()
 
-    with torch.no_grad():
-        for index in range(X_test.shape[0]):
-            # Assume X_test is a tensor and you're accessing it by index
-            tensor_sample = X_test[index]
-
-            # Move the tensor sample to CPU, converting it to a NumPy array
-            sample_np = tensor_sample.cpu().numpy()
-
-            # Inverse transform using the scaler
-            original_values = scaler_x.inverse_transform(sample_np.reshape(1, -1))  # Reshape to 2D array if necessary
-
-            # Extract the azimuth and range values based on your dataset structure
-            random_azimuth = original_values[0][0]  # First feature
-            random_range = original_values[0][1]    # Second feature
-            predicted_alpha, predicted_bank = predicting(random_azimuth, random_range, scaler_x, scaler_y)
-            predicted_values = [predicted_alpha, predicted_bank]
-
-            actual_values = y_test[index].cpu().numpy()
-            actual_values = scaler_y.inverse_transform(actual_values)
-            mse = np.mean((predicted_values - actual_values) ** 2)
-
-            azimuth_value = X_test[index][0]  # This is a tensor
-            range_value = X_test[index][1]     # This is also a tensor
-            
-            # Create a 2D array for inverse transformation
-            values_to_transform = np.array([[azimuth_value.cpu().item(), range_value.cpu().item()]])
-            
-            # Perform inverse transformation for both azimuth and range
-            transformed_values = scaler_x.inverse_transform(values_to_transform)  # Should work now
-            azimuth_transformed = transformed_values[0][0]  # Get transformed azimuth
-            range_transformed = transformed_values[0][1]    # Get transformed range
-            
-            # Store the transformed values
-            azimuth_values.append(azimuth_transformed)
-            range_values.append(range_transformed)
-            mse_values.append(mse)
-
-    average_mse = np.mean(mse_values)
-
-    plt.figure(figsize=(12, 6))
-    plt.plot(mse_values, label='MSE per Sample', linestyle='-', marker='o', markersize=3)
-    plt.axhline(y=average_mse, color='r', linestyle='--', label=f'Average MSE: {average_mse:.4f}')
-    plt.title('Mean Squared Error Across Samples')
-    plt.xlabel('Sample Index')
-    plt.ylabel('Mean Squared Error')
-    plt.legend()
-    plt.grid(True)
-
-    plt.savefig('mse_compare.png')
-    plt.close()  
 
 
 
