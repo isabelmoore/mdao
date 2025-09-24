@@ -76,89 +76,95 @@ the driver and delievery in these points:
         https://www.worldscientific.com/doi/epdf/10.1142/S021759591950009X
 
 '''
-
-class TrajectoryEnv():
-    def __init__(self, input_deck, problem, scenario):
-        super(TrajectoryEnv, self).__init__()
+class TrajectoryEnv:
+    def __init__(self, input_deck):
         self.input_deck = input_deck
-        self.problem = problem
-        self.scenario = scenario
-        self.pose = np.zeros(8, dtype=np.float32)
-        self.action = np.zeros(6, dtype=np.float32)
-        self.h_ideal_term = self.input_deck["trajectory_phases"]["terminal"]["constraints"]["boundary"]["h"]["equals"]
-        self.gam_bound_boost = 0.0
-        self.ts = "traj_vehicle_0"        
-    
-    def run(self, case, input_deck):
-        casenum= case[0]
-        alpha1 = case[1]
-        alpha2 = case[2]
-        
-        print(f"Running Trajectory Tests for case: {casenum}")
-        print(f"Processing case data: \n{case}") 
+        self.ts = "traj_vehicle_0"
 
-        problem_name = f'case_{casenum}'
-        p = om.Problem(name=problem_name)
+    # ---------- tiny utils ----------
+    @staticmethod
+    def _read_text(p: Path) -> str:
+        if not p.exists(): return ""
+        try: return p.read_text(encoding="utf-8", errors="ignore")
+        except Exception: return p.read_bytes().decode("utf-8", errors="ignore")
 
-        scenario = dymos_generator(problem=p, input_deck=input_deck)
-        p.model_options["vehicle_0"]["trajectory_phases"]["boost_11"]["initial_conditions"]["controls"]["alpha"][0] = alpha1
-        p.model_options["vehicle_0"]["trajectory_phases"]["boost_11"]["initial_conditions"]["controls"]["alpha"][1] = alpha2
-        scenario.setup()
+    @staticmethod
+    def _last_major_before_exit(txt: str) -> int | None:
+        k = max(txt.rfind("SNOPTA EXIT"), txt.rfind("SNOPTC EXIT"))
+        if k == -1: return None
+        for line in reversed(txt[:k].splitlines()):
+            s = line.strip()
+            if not s: continue
+            m = re.match(r"\s*(\d+)\b", s)
+            if m: return int(m.group(1))
+        return None
 
-        print("\nRunning Optimality Driver")
-        
+    # ---------- candidate sets (reduced randomness) ----------
+    @staticmethod
+    def _sobol_box_2d(seed_xy, n_pts, span_frac=(0.2, 0.2), bounds=None):
+        x0, y0 = map(float, seed_xy)
+        sx = max(abs(x0)*span_frac[0], 1e-3)
+        sy = max(abs(y0)*span_frac[1], 1e-3)
+        lo = np.array([x0 - sx, y0 - sy]); hi = np.array([x0 + sx, y0 + sy])
         try:
-            dm.run_problem(scenario.p, run_driver=True, simulate=True, simulate_kwargs={"method": "RK45"})
+            from scipy.stats import qmc
+            eng = qmc.Sobol(d=2, scramble=False)
+            pts = eng.random_base2(int(np.ceil(np.log2(n_pts))))[:n_pts]
+            cand = qmc.scale(pts, lo, hi)
+            cands = [tuple(map(float, xy)) for xy in cand]
+        except Exception:
+            k = max(3, int(np.ceil(np.sqrt(n_pts))))
+            xs = np.linspace(lo[0], hi[0], k); ys = np.linspace(lo[1], hi[1], k)
+            cands = [(x, y) for x in xs for y in ys][:n_pts]
+        if bounds:
+            (x_lo, x_hi), (y_lo, y_hi) = bounds
+            cands = [(x,y) for (x,y) in cands if x_lo <= x <= x_hi and y_lo <= y <= y_hi]
+        cands = [(x0, y0)] + cands
+        uniq = list(dict.fromkeys([(round(x,12), round(y,12)) for (x,y) in cands]))
+        return [(x, y) for (x, y) in uniq]
 
-            with open(self.problem.get_outputs_dir() / "SNOPT_print.out", encoding="utf-8", errors='ignore') as f:
-                SNOPT_history = f.read()
+    # ---------- single candidate evaluation (static for multiprocessing) ----------
+    @staticmethod
+    def _run_one_alpha_case(case_tuple, input_deck):
+        """
+        case_tuple = (id, alpha1, alpha2)
+        Returns dict with 'cost' = last major iterations (lower is better).
+        """
+        cid, a1, a2 = case_tuple
+        PENALTY_FAIL = 1e9
+        try:
+            p = om.Problem(name=f"case_{cid}")
+            deck = copy.deepcopy(input_deck)
+            scen = dymos_generator(problem=p, input_deck=deck)
 
-            # Define where the exit code information starts
-            exit_code_start = SNOPT_history.rfind("SNOPTC EXIT")
-            exit_code_end = SNOPT_history.find("\n", exit_code_start)
+            # Set alphas in the model options used by your generator
+            mo = scen.p.model_options["vehicle_0"]
+            mo["trajectory_phases"]["boost_11"]["initial_conditions"]["controls"]["alpha"][0] = float(a1)
+            mo["trajectory_phases"]["boost_11"]["initial_conditions"]["controls"]["alpha"][1] = float(a2)
 
-            # Extract the exit code line
-            exit_code = int((SNOPT_history[exit_code_start:exit_code_end]).split()[2])
+            scen.setup()
+            dm.run_problem(scen.p, run_driver=True, simulate=False)
 
-            # TO DO: fix this tomatch that of major iterattions, not minor
-            before_exit = SNOPT_history[:exit_code_start].splitlines()
-            last_row_line = before_exit[-1].strip()
-            last_major_iter = int(last_row_line.split()[0])
+            outdir = scen.p.get_outputs_dir()
+            txt = TrajectoryEnv._read_text(outdir / "SNOPT_summary.out") or \
+                  TrajectoryEnv._read_text(outdir / "SNOPT_print.out")
+            last_major = TrajectoryEnv._last_major_before_exit(txt) if txt else None
+            cost = float(last_major) if last_major is not None else PENALTY_FAIL
 
-            print("Exit code:", exit_code)
-            print("Last major iteration:", last_major_iter)
-            return last_major_iter
-
+            return {"case": cid, "alpha1": a1, "alpha2": a2, "last_major": last_major, "cost": cost, "ok": last_major is not None}
         except Exception as e:
-            print(f"Error during trajectory test for case {casenum}: {e}")
-            return None
+            return {"case": cid, "alpha1": a1, "alpha2": a2, "last_major": None, "cost": PENALTY_FAIL, "ok": False, "error": str(e)}
 
-    def make_noise():
-        return cases?
-    def run_parallel_envs(self, 
-        input_deck: dict,
-        seed_alphas: tuple[float, float],
-        *,
-        n_candidates: int = 24,
-        bounds: tuple[tuple[float, float], tuple[float, float]] | None = None,
-        method: str = "sobol",
-        max_workers: int = 8,
-        logdir: Path = Path("snopt_logs")
-        ):
-        '''
-        Executes the optimization process using the Nelder-Mead method. Identifies optimal control parameters.
-        '''
+    # ---------- public: build cases + run in parallel ----------
+    def build_alpha_cases(self, seed_alphas, n_candidates=24, span_frac=(0.2,0.2), bounds=None, start_idx=0):
+        pts = self._sobol_box_2d(seed_alphas, n_pts=n_candidates, span_frac=span_frac, bounds=bounds)
+        return [(start_idx+i, float(a1), float(a2)) for i, (a1, a2) in enumerate(pts)]
 
-        print("Stepping...")
+    def run_parallel_envs_alpha(self, seed_alphas, *, n_candidates=24, span_frac=(0.2,0.2),
+                                bounds=None, processes=8):
+        cases = self.build_alpha_cases(seed_alphas, n_candidates=n_candidates, span_frac=span_frac, bounds=bounds)
+        with multiprocessing.Pool(processes=processes) as pool:
+            results = pool.map(partial(TrajectoryEnv._run_one_alpha_case, input_deck=self.input_deck), cases)
+        best = min(results, key=lambda r: r["cost"])
+        return results, best
 
-        self.update_state()
-        num_processors = 28
-        with multiprocessing.Pool(processes=num_processors) as pool:
-            print("Created pool...")
-            # Map the function to the list of traj doe values
-            task_partial = partial(run, input_deck=input_deck)
-            results = pool.map(task_partial, cases)
-
-        print("Results finished...")
-        pool.close()
-        pool.join()
