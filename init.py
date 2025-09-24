@@ -1,115 +1,346 @@
-import re
+'''
+Purpose of this file is to create and access in between the inputdeck information 
+and generating the SNOPT output of the alpha and bank vectors (boost_11 and terminal)
+'''
 
-class TrajectoryEnv:
-    def __init__(self, input_deck):
-        self.input_deck = input_deck
-        self.ts = "traj_vehicle_0"
+import os, sys, time, copy, shutil
+from pathlib import Path
+from datetime import datetime
+from yaml import safe_load, dump
+import numpy as np
+import openmdao.api as om
+import dymos as dm
+from dymos.visualization.timeseries.bokeh_timeseries_report import make_timeseries_report
+import matplotlib.pyplot as plt
+import tempfile
+import multiprocessing
+from functools import partial
+from pathlib import Path
+from bs4 import BeautifulSoup
+import scipy.stats.qmc as qmc
+import pandas as pd
+from itertools import product
+import sqlite3
 
-    # ---------------- keep these AS IS ----------------
-    @staticmethod
-    def _read_text(p: Path) -> str:
-        if not p.exists(): return ""
-        try: return p.read_text(encoding="utf-8", errors="ignore")
-        except Exception: return p.read_bytes().decode("utf-8", errors="ignore")
 
-    @staticmethod
-    def _last_major_before_exit(txt: str) -> int | None:
-        # first int on the last data line before SNOPTA/SNOPTC EXIT
-        k = max(txt.rfind("SNOPTA EXIT"), txt.rfind("SNOPTC EXIT"))
-        if k == -1: return None
-        for line in reversed(txt[:k].splitlines()):
-            s = line.strip()
-            if not s: continue
-            m = re.match(r"\s*(\d+)\b", s)
-            if m: return int(m.group(1))
-        return None
-    # --------------------------------------------------
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 
-    @staticmethod
-    def _cloud(seed, n_pts, span_frac=(0.25, 0.25), abs_min_span=0.5, bounds=None):
-        """Small deterministic box around seed; Sobol if available, else tiny grid."""
-        a1, a2 = map(float, seed)
-        s1 = max(abs(a1)*span_frac[0], abs_min_span)
-        s2 = max(abs(a2)*span_frac[1], abs_min_span)
-        lo = np.array([a1 - s1, a2 - s2]); hi = np.array([a1 + s1, a2 + s2])
-        pts = [(a1, a2)]
-        try:
-            from scipy.stats import qmc
-            eng = qmc.Sobol(d=2, scramble=False)
-            X = eng.random_base2(int(np.ceil(np.log2(n_pts))))[:n_pts]
-            X = qmc.scale(X, lo, hi)
-            pts += [tuple(map(float, x)) for x in X]
-        except Exception:
-            k = max(3, int(np.ceil(np.sqrt(n_pts))))
-            xs = np.linspace(lo[0], hi[0], k); ys = np.linspace(lo[1], hi[1], k)
-            pts += [(float(x), float(y)) for x in xs for y in ys][:n_pts]
-        if bounds:
-            (l1,h1),(l2,h2) = bounds
-            pts = [(x,y) for (x,y) in pts if l1<=x<=h1 and l2<=y<=h2]
-        # de-dup
-        uniq = list(dict.fromkeys([(round(x,12), round(y,12)) for (x,y) in pts]))
-        return [(x,y) for (x,y) in uniq]
+paths_to_modules = [
+    "scenarios",
+    "scenarios/concepts",
+    "scenarios/configs",
+    "src/models/aero/datcom",
+    "src/models/layout",
+    "src/models/loads",
+    "src/models/power",
+    "src/models/prop/solid",
+    "src/models/prop/inlet_tables",
+    "src/models/radar",
+    "src/models/structure",
+    "src/models/thermal",
+    "src/models/warhead",
+    "src/models/warhead/bf_warhead",
+    "src/models/weapondatalink",
+    "src/models/weight",
+    "tools/helpers/",
+    "tools/plotters",
+    "tools/ppt",
+    "tools/datcom_nn",
+]
 
-    @staticmethod
-    def _eval_alpha_case(case_id, a1, a2, input_deck):
-        """Fresh Problem/scenario → run driver → parse last major → cost."""
-        PENALTY_FAIL = 1e9
-        try:
-            p = om.Problem(name=f"case_{case_id}")
-            deck = copy.deepcopy(input_deck)
-            scen = dymos_generator(problem=p, input_deck=deck)
 
-            # set alphas (both places people commonly use)
-            try:
-                scen.p.model_options["vehicle_0"]["trajectory_phases"]["boost_11"]["initial_conditions"]["controls"]["alpha"][0] = float(a1)
-                scen.p.model_options["vehicle_0"]["trajectory_phases"]["boost_11"]["initial_conditions"]["controls"]["alpha"][1] = float(a2)
-            except Exception: pass
-            try:
-                p.model_options["vehicle_0"]["trajectory_phases"]["boost_11"]["initial_conditions"]["controls"]["alpha"][0] = float(a1)
-                p.model_options["vehicle_0"]["trajectory_phases"]["boost_11"]["initial_conditions"]["controls"]["alpha"][1] = float(a2)
-            except Exception: pass
+# TO DO: match with home directory of repo
+os.chdir(r"/home/imoore/misslemdao")
 
-            scen.setup()
-            dm.run_problem(scen.p, run_driver=True, simulate=False)
+project_dir = Path(__file__).resolve().parent.parent  
 
-            outdir = scen.p.get_outputs_dir()
-            txt = (TrajectoryEnv._read_text(outdir / "SNOPT_summary.out")
-                   or TrajectoryEnv._read_text(outdir / "SNOPT_print.out"))
-            last_major = TrajectoryEnv._last_major_before_exit(txt) if txt else None
-            return float(last_major) if last_major is not None else PENALTY_FAIL
-        except Exception:
-            return PENALTY_FAIL
+for path in paths_to_modules:
+    if str(path) not in sys.path:
+        sys.path.append(str(path))
 
-    def perturb_optimize(self, seed_alphas, *, rounds=3, per_round=10,
-                         span_schedule=(0.5, 0.25, 0.1),
-                         bounds=None, abs_min_span=0.5):
-        """Serial, shrinking-box perturbation. Returns (best_alphas, best_cost)."""
-        assert rounds == len(span_schedule)
-        best = (float(seed_alphas[0]), float(seed_alphas[1]))
-        best_cost = self._eval_alpha_case(0, best[0], best[1], self.input_deck)
+from dymos_generator import dymos_generator
 
-        cid = 1
-        for r in range(rounds):
-            frac = span_schedule[r]
-            cand = self._cloud(best, n_pts=per_round, span_frac=(frac, frac),
-                               abs_min_span=abs_min_span, bounds=bounds)
-            for (a1,a2) in cand[1:]:   # skip seed
-                cost = self._eval_alpha_case(cid, a1, a2, self.input_deck)
-                cid += 1
-                if cost < best_cost:
-                    best_cost, best = cost, (a1, a2)
-        return best, best_cost
-env = TrajectoryEnv(input_deck)
 
-seed = tuple(input_deck["trajectory_phases"]["boost_11"]["initial_conditions"]["controls"]["alpha"])  # e.g., (0.0, 5.0)
+def generate_design_space(variables, num_samples_azimuth, num_samples_range, seed=42):
+    print("Generating design space...")
+    
+    azimuth_bounds = variables["azimuth"]['bounds']
+    range_bounds = variables["range"]['bounds']
+    
+    azimuth_data = np.linspace(azimuth_bounds[0], azimuth_bounds[1], num_samples_azimuth)
+    range_data = np.linspace(range_bounds[0], range_bounds[1], num_samples_range)
 
-best_alphas, best_cost = env.perturb_optimize(
-    seed_alphas=seed,
-    rounds=3,
-    per_round=12,
-    span_schedule=(0.5, 0.25, 0.1),     # shrink each round
-    bounds=[(-5.0, 5.0), (0.0, 10.0)],  # clamp to valid values
-    abs_min_span=0.5,                   # makes α1 explore even if seed is 0.0
-)
+    print(azimuth_data)
+    print(range_data)
+    
+    azimuth_grid, range_grid = np.meshgrid(azimuth_data, range_data)
+    
+    # Reshape to list of tuples
+    casenums = np.arange(num_samples_azimuth*num_samples_range)
+    print("Case Numbers:", len(casenums))
+    initial_grid = list(zip(casenums,azimuth_grid.ravel(), range_grid.ravel()))
+    
 
-print("best alphas:", best_alphas, "min major iters:", best_cost)
+    # Latin Hyper Cube Implementation
+    # num_vars = 2  
+    # LH_generator = qmc.LatinHypercube(num_vars, seed=seed, scramble=False)
+
+    # LH_samples = LH_generator.random(num_samples)
+    
+    # LH_scaled = qmc.scale(LH_samples, np.array([azimuth_bounds[0], range_bounds[0]]), 
+    #                           np.array([azimuth_bounds[1], range_bounds[1]]))
+
+    # combined_grid = np.vstack((initial_grid, LH_scaled))  # Combine both sources
+
+    # df = pd.DataFrame(data=initial_grid, columns=['azimuth', 'range'])
+    
+    print("Design space generated.")
+    return initial_grid
+
+def store_results(results, db_filename):
+
+    """
+    Storing Multi-valued Attributes in Relational Databases
+    When you have data that consists of lists or arrays (like multiple values for alpha and bank), 
+    the best practice in relational databases is to normalize your data. This means creating separate 
+    tables to hold related data instead of trying to fit multiple values into a single column.
+    """
+    connection = sqlite3.connect(db_filename)
+    cursor = connection.cursor()
+    
+    # Clear previous data
+    cursor.execute('DROP TABLE IF EXISTS boost_11_timeseries')
+    cursor.execute('DROP TABLE IF EXISTS terminal_timeseries')
+    cursor.execute('DROP TABLE IF EXISTS results')
+
+    # Create tables
+    cursor.execute('''
+        CREATE TABLE results (
+            case_num INTEGER PRIMARY KEY,
+            azimuth REAL,
+            range REAL,
+            status INTEGER,
+            iterations INTEGER     
+        )
+    ''')
+
+    cursor.execute('''
+        CREATE TABLE boost_11_timeseries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            case_num INTEGER,
+            alpha REAL,
+            bank REAL,
+            FOREIGN KEY(case_num) REFERENCES results(case_num)
+        )
+    ''')
+
+    cursor.execute('''
+        CREATE TABLE terminal_timeseries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            case_num INTEGER,
+            alpha REAL,
+            bank REAL,
+            FOREIGN KEY(case_num) REFERENCES results(case_num)
+        )
+    ''')
+
+    # Inserting results into results table
+    for index, result in enumerate(results):
+        cursor.execute('''
+            INSERT INTO results (case_num, azimuth, range, status, iterations)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (index + 1, result['azimuth'], result['range'], result['status'], result['iterations']))
+
+        # Insert boost_11 timeseries
+        boost_alpha_list = result['boost_11']['alpha']  
+        boost_bank_list = result['boost_11']['bank']  
+
+        for alpha, bank in zip(boost_alpha_list, boost_bank_list):
+            cursor.execute('''
+                INSERT INTO boost_11_timeseries (case_num, alpha, bank)
+                VALUES (?, ?, ?)
+            ''', (index + 1, alpha, bank))
+
+
+        # Insert terminal timeseries
+        terminal_alpha_list = result['terminal']['alpha']  
+        terminal_bank_list = result['terminal']['bank']    
+
+        for alpha, bank in zip(terminal_alpha_list, terminal_bank_list):
+            cursor.execute('''
+                INSERT INTO terminal_timeseries (case_num, alpha, bank)
+                VALUES (?, ?, ?)
+            ''', (index + 1, alpha, bank))
+
+    connection.commit()
+    connection.close()
+def merge_input_decks(base, child):
+    for key, value in base.items():
+        if key not in child:
+            child[key] = value
+        elif isinstance(value, dict) and isinstance(child[key], dict):
+            merge_input_decks(value, child[key])
+    return child
+
+def run_traj_test(case, input_deck):
+    
+    casenum= case[0]
+    azimuth= case[1]
+    range_ = case[2]
+    
+    print(f"Running Trajectory Tests for case: {casenum}")
+    print(f"Processing case data: \n{case}") 
+
+    problem_name = f'case_{casenum}'
+    p = om.Problem(name=problem_name)
+
+    scenario = dymos_generator(problem=p, input_deck=input_deck)
+    scenario.p.model_options["vehicle_0"]["trajectory_phases"]["terminal"]["constraints"]["boundary"]["azimuth"]["equals"] = azimuth
+    scenario.p.model_options["vehicle_0"]["trajectory_phases"]["terminal"]["constraints"]["boundary"]["range"]["equals"] = range_
+
+    scenario.p.model_options["vehicle_0"]["trajectory_phases"]["boost_11"]["initial_conditions"]["controls"]["bank"][0] = azimuth / 2
+    scenario.p.model_options["vehicle_0"]["trajectory_phases"]["boost_11"]["initial_conditions"]["controls"]["bank"][1] = azimuth / 2
+    scenario.p.model_options["vehicle_0"]["trajectory_phases"]["terminal"]["initial_conditions"]["controls"]["bank"][0] = azimuth / 2
+    scenario.p.model_options["vehicle_0"]["trajectory_phases"]["terminal"]["initial_conditions"]["controls"]["bank"][1] = azimuth / 2
+
+    scenario.setup()
+
+    try:     
+        dm.run_problem(scenario.p, run_driver=True, simulate=False, restart=r"/home/imoore/misslemdao/tools/traj_ann/dymos_solution.db")
+        # om.n2(scenario.p, outfile="n2_post_run.html")
+
+        with open(p.get_outputs_dir() / "SNOPT_print.out", encoding="utf-8", errors='ignore') as f:
+            SNOPT_history = f.read()
+
+        # Define where the exit code information starts
+        exit_code_start = SNOPT_history.rfind("SNOPTC EXIT")
+        exit_code_end = SNOPT_history.find("\n", exit_code_start)
+
+        # Extract the exit code line
+        exit_code = int((SNOPT_history[exit_code_start:exit_code_end]).split()[2])
+
+        # TO DO: fix this tomatch that of major iterattions, not minor
+        iter_code_start = SNOPT_history.rfind("No. of iterations")
+        iter_code_end = SNOPT_history.find("\n", iter_code_start)
+
+        iterations = int((SNOPT_history[iter_code_start:iter_code_end]).split()[3])
+
+
+        print("Exit Code", exit_code)
+        if exit_code != 0:
+            status = 0 # FAILURE
+        else:
+            status = 1 # SUCCESS
+        result = {
+            'azimuth': azimuth,
+            'range': range,
+            'boost_11': {
+                'alpha': [item for sublist in p.get_val("%s.%s.%s.timeseries.alpha" % ("traj_vehicle_0", "phases", "boost_11"), units="deg").tolist() for item in sublist], 
+                'bank': [item for sublist in p.get_val("%s.%s.%s.timeseries.bank" % ("traj_vehicle_0", "phases", "boost_11"), units="deg").tolist() for item in sublist], 
+            },
+            'terminal': {
+                'alpha': [item for sublist in p.get_val("%s.%s.%s.timeseries.alpha" % ("traj_vehicle_0", "phases", "terminal"), units="deg").tolist() for item in sublist], 
+                'bank': [item for sublist in p.get_val("%s.%s.%s.timeseries.bank" % ("traj_vehicle_0", "phases", "terminal"), units="deg").tolist() for item in sublist], 
+            },
+            'status': status,
+            'iterations': iterations
+        }
+    except Exception as e:
+        print(f"Error during trajectory test for case {casenum}: {e}")
+        result = {
+            'azimuth': azimuth,
+            'range': range,
+            'boost_11': {
+                'alpha': [item for sublist in p.get_val("%s.%s.%s.timeseries.alpha" % ("traj_vehicle_0", "phases", "boost_11"), units="deg").tolist() for item in sublist], 
+                'bank': [item for sublist in p.get_val("%s.%s.%s.timeseries.bank" % ("traj_vehicle_0", "phases", "boost_11"), units="deg").tolist() for item in sublist], 
+            },
+            'terminal': {
+                'alpha': [item for sublist in p.get_val("%s.%s.%s.timeseries.alpha" % ("traj_vehicle_0", "phases", "terminal"), units="deg").tolist() for item in sublist], 
+                'bank': [item for sublist in p.get_val("%s.%s.%s.timeseries.bank" % ("traj_vehicle_0", "phases", "terminal"), units="deg").tolist() for item in sublist], 
+            },
+            'status': 0,
+            'iterations': 0
+        }
+
+    return result
+
+def main(num_samples_azimuth, num_samples_range, num_processors):
+
+    project_root = Path(__file__).parents[2]  
+    if str(project_root) not in sys.path:
+        sys.path.append(str(project_root))
+
+    start_time = time.time()
+    
+    input_deck_base = "base_input_deck.yml"
+    input_deck_filename = 'one_stage_one_pulse_traj_ann.yml'
+
+    input_deck_path = os.path.join("scenarios/input_decks/", input_deck_filename)
+    input_deck_base_path = os.path.join("scenarios/input_decks/", input_deck_base)
+
+    with open(input_deck_path, "r") as f:
+        input_deck_child = safe_load(f)
+
+    # Load base and child files
+    with open(input_deck_base_path) as base_file:
+        base = safe_load(base_file)
+
+    # Merge base into child 
+    if "base" in input_deck_child:
+        del input_deck_child["base"]
+
+    # input_deck = merge_input_decks(base, input_deck_child)
+    input_deck = input_deck_child
+    variables = {
+        "azimuth": {'bounds': np.array([-90, 90])},
+        "range": {'bounds': np.array([10, 60])},
+    }
+    
+    # Create output directory
+    dataset_name = "altitude_mach_data"
+    base_temp_dir = Path("./datasets") / dataset_name
+    os.makedirs(base_temp_dir, exist_ok=True)
+
+    # Create the design space
+    cases = generate_design_space(variables, num_samples_azimuth, num_samples_range)
+
+
+    with multiprocessing.Pool(processes=num_processors) as pool:
+        print("Created pool...")
+        # Map the function to the list of traj doe values
+        task_partial = partial(run_traj_test, input_deck=input_deck)
+        results = pool.map(task_partial, cases)
+
+    print("Results finished...")
+    pool.close()
+    pool.join()
+
+
+    db_filename = f'trajectory_results_azimuth{num_samples_azimuth}_range{num_samples_range}_cores{num_processors}_date_{datetime.now().strftime("%Y_%m_%d")}_time_{datetime.now().strftime("%H%M")}.db'    
+    store_results(results, db_filename)
+
+    connection = sqlite3.connect(db_filename)
+    
+    results_df = pd.read_sql_query('SELECT * FROM results', connection)
+    print("Results Table:")
+    print(results_df)
+    print("\n")  
+
+    boost11_df = pd.read_sql_query('SELECT * FROM boost_11_timeseries', connection)
+    print("Boost 11 Timeseries Table:")
+    print(boost11_df)
+    print("\n")  
+
+    terminal_df = pd.read_sql_query('SELECT * FROM terminal_timeseries', connection)
+    print("Terminal Timeseries Table:")
+    print(terminal_df)
+
+    connection.close()
+
+
+    elapsed_time = time.time() - start_time
+    print(f"Data generation and processing completed in {elapsed_time:.2f} seconds.")
+
+
+if __name__ == '__main__':
+    main(num_samples_azimuth=2, num_samples_range=2, num_processors=2) # 500^2 = 250_000 samples, 20 cores (max)
