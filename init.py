@@ -55,7 +55,7 @@ class TrajectoryEnv():
         except Exception as e:
             print(f"[ERROR] Failed to update state: {e}")  
 
-    def reward(self, scenarp):
+    def run(self):
         '''
         Computes penalties based on trajectory metrics
         '''
@@ -79,11 +79,12 @@ class TrajectoryEnv():
         exit_code = int((SNOPT_history[exit_code_start:exit_code_end]).split()[2])
 
         # TO DO: fix this tomatch that of major iterattions, not minor
-        iter_code_start = SNOPT_history.rfind("No. of iterations")
-        iter_code_end = SNOPT_history.find("\n", iter_code_start)
+        before_exit = SNOPT_history[:exit_code_start].splitlines()
+        last_row_line = before_exit[-1].strip()
+        last_major_iter = int(last_row_line.split()[0])
 
-        iterations = int((SNOPT_history[iter_code_start:iter_code_end]).split()[3])
-
+        print("Exit code:", exit_code)
+        print("Last major iteration:", last_major_iter)
     
     def objective_function(self, params):
         '''
@@ -97,7 +98,6 @@ class TrajectoryEnv():
         self.problem.model_options["vehicle_0"]["trajectory_phases"]["boost_11"]["initial_conditions"]["controls"]["alpha"][0] = self.alpha_boost_1
         self.problem.model_options["vehicle_0"]["trajectory_phases"]["boost_11"]["initial_conditions"]["controls"]["alpha"][1] = self.alpha_boost_2
         
-
         try:
             self.scenario.setup()
         except Exception as e:
@@ -110,10 +110,48 @@ class TrajectoryEnv():
         '''
         Executes the optimization process using the Nelder-Mead method. Identifies optimal control parameters.
         '''
+
+        
         
         print("Stepping...")
 
         self.update_state()
+
+
+
+        print("Initial Conditions Before: ")
+        print(f"\tBoost Alphas: \n\t\t ", p.model_options["vehicle_0"]["trajectory_phases"]["boost_11"]["initial_conditions"]["controls" ]["alpha"], " deg")
+
+        # train model to find optimal parameters for initial conditions
+        env = TrajectoryEnv(input_deck, p, scenario)
+        # env.step()s
+        # alpha_boost_1, alpha_boost_2 = env.actions
+
+        # # update initial conditions with the optimized results
+        # p.model_options["vehicle_0"]["trajectory_phases"]["boost_11"]["initial_conditions"]["controls"]["alpha"][0] = 0.0010003987
+        # p.model_options["vehicle_0"]["trajectory_phases"]["boost_11"]["initial_conditions"]["controls"]["alpha"][1] = 0.009254456
+
+        print("Initial Conditions After: ")
+        print(f"\tBoost Alphas: \n\t\t ", p.model_options["vehicle_0"]["trajectory_phases"]["boost_11"]["initial_conditions"]["controls" ]["alpha"], " deg")
+
+        scenario.setup()
+        problem_report_dir = p.get_reports_dir()
+
+        try:
+            if input_deck["optimizer_settings"]["feasibility_driver"]:
+                print("\nRunning Feasibility Driver")
+                # run and simulate afterwards, see if it errors out, if it does just make the traj report without sim data
+                scenario.p.driver.opt_settings["Problem Type"] = "Feasible point"
+                dm.run_problem(scenario.p, run_driver=True, simulate=False, make_plots=False)
+                scenario.p.driver.opt_settings["Problem Type"] = "Minimize"
+        except:
+            pass
+
+
+        print("\nRunning Optimality Driver")
+
+        dm.run_problem(scenario.p, run_driver=True, simulate=True, make_plots=True, simulate_kwargs={"method": "RK45"})  
+              
         initial_guess = [self.alpha_boost_1, self.alpha_boost_2]
         result = minimize(self.objective_function, initial_guess, method='Nelder-Mead', tol=1e-3, options={'maxiter': 100})
         self.actions = np.array(result.x, dtype=np.float32).flatten()
