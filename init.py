@@ -168,3 +168,47 @@ class TrajectoryEnv:
         best = min(results, key=lambda r: r["cost"])
         return results, best
 
+
+start_time = time.time()
+
+input_deck_path = os.path.join(os.path.dirname(__file__), "scenarios/input_decks/", input_deck_filename)
+input_deck_base_path = os.path.join(os.path.dirname(__file__), "scenarios/input_decks/", input_deck_base)
+
+with open(input_deck_path, "r") as f:
+    input_deck_child = safe_load(f)
+
+# Load base and child files
+with open(input_deck_base_path) as base_file:
+    base = safe_load(base_file)
+
+# Merge base into child (child takes precedence)
+if "base" in input_deck_child:
+    del input_deck_child["base"]  # Remove the 'base' key after processing if it exists
+
+input_deck = merge_input_decks(base, input_deck_child)
+
+input_deck_optimized = copy.deepcopy(input_deck)
+
+problem_name = input_deck_filename.split(".")[0] + datetime.now().strftime("_date_%Y_%m_%d_time_%H%M")
+
+# =============================================================================
+# Create and run scenario
+# =============================================================================
+# make all reports globally go here
+os.environ["OPENMDAO_WORKDIR"] = str(Path(Path(__file__).parent, "reports"))
+p = om.Problem(name=problem_name, reports=["inputs", "n2", "optimizer"])
+
+vehicle_num = 0  # default vehicle num because missilemdao only runs one vehicle
+multiple_vehicles = False
+scenario = dymos_generator(problem=p, input_deck=input_deck, vehicle_num=vehicle_num, multiple_vehicles=multiple_vehicles)
+
+from train_init_cond import TrajectoryEnv
+
+import warnings
+warnings.filterwarnings("ignore")
+
+print("Initial Conditions Before: ")
+print(f"\tBoost Alphas: \n\t\t ", p.model_options["vehicle_0"]["trajectory_phases"]["boost_11"]["initial_conditions"]["controls" ]["alpha"], " deg")
+
+# train model to find optimal parameters for initial conditions
+env = TrajectoryEnv(input_deck, p, scenario)
