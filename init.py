@@ -7,7 +7,7 @@ import os
 from datetime import datetime
 from pathlib import Path
 import openmdao.api as om
-
+import dymos as dm
 
 '''
 This script is designed to help in reducing the amount of major iterations for SNOPT. 
@@ -55,24 +55,35 @@ class TrajectoryEnv():
         except Exception as e:
             print(f"[ERROR] Failed to update state: {e}")  
 
-    def reward(self):
+    def reward(self, scenarp):
         '''
         Computes penalties based on trajectory metrics
         '''
 
         print()
         print("Rewarding...")
-        h_boost, range_boost = self.pose
+        scenario = self.scenario
+        problem = self.problem
 
-        range_boost_penalty = (range_boost / 1000) ** 2
-        h_boost_penalty = (h_boost / 1000) ** 2
-        total_error = -(range_boost_penalty + h_boost_penalty)
-        
-        print(f"Raw Penalties: \n\tBoost Range: {range_boost} \n\tBoost Height: {h_boost}")        
-        print(f"Total Penalty: \t{total_error}")
-        print(f"Params: \t{self.alpha_boost_1, self.alpha_boost_2}")
+        dm.run_problem(scenario.problem, run_driver=True, simulate=False)
+        # om.n2(scenario.p, outfile="n2_post_run.html")
 
-        return total_error
+        with open(self.problem.get_outputs_dir() / "SNOPT_print.out", encoding="utf-8", errors='ignore') as f:
+            SNOPT_history = f.read()
+
+        # Define where the exit code information starts
+        exit_code_start = SNOPT_history.rfind("SNOPTC EXIT")
+        exit_code_end = SNOPT_history.find("\n", exit_code_start)
+
+        # Extract the exit code line
+        exit_code = int((SNOPT_history[exit_code_start:exit_code_end]).split()[2])
+
+        # TO DO: fix this tomatch that of major iterattions, not minor
+        iter_code_start = SNOPT_history.rfind("No. of iterations")
+        iter_code_end = SNOPT_history.find("\n", iter_code_start)
+
+        iterations = int((SNOPT_history[iter_code_start:iter_code_end]).split()[3])
+
     
     def objective_function(self, params):
         '''
@@ -86,6 +97,7 @@ class TrajectoryEnv():
         self.problem.model_options["vehicle_0"]["trajectory_phases"]["boost_11"]["initial_conditions"]["controls"]["alpha"][0] = self.alpha_boost_1
         self.problem.model_options["vehicle_0"]["trajectory_phases"]["boost_11"]["initial_conditions"]["controls"]["alpha"][1] = self.alpha_boost_2
         
+
         try:
             self.scenario.setup()
         except Exception as e:
