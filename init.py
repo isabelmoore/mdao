@@ -1,164 +1,115 @@
-import numpy as np
-from math import * 
-from scipy.optimize import minimize
-import matplotlib.pyplot as plt
-from matplotlib import cm
-import os
-from datetime import datetime
-from pathlib import Path
-import openmdao.api as om
-import dymos as dm
-import os, sys, time, copy, shutil
-from pathlib import Path
-from datetime import datetime
-from yaml import safe_load, dump
-import numpy as np
-import openmdao.api as om
-import dymos as dm
-from dymos.visualization.timeseries.bokeh_timeseries_report import make_timeseries_report
-import matplotlib.pyplot as plt
-import tempfile
-import multiprocessing
-from functools import partial
-from pathlib import Path
-from bs4 import BeautifulSoup
-import scipy.stats.qmc as qmc
-import pandas as pd
-from itertools import product
-import sqlite3
+import re
 
-paths_to_modules = [
-    "scenarios",
-    "scenarios/concepts",
-    "scenarios/configs",
-    "src/models/aero/datcom",
-    "src/models/layout",
-    "src/models/loads",
-    "src/models/power",
-    "src/models/prop/solid",
-    "src/models/prop/inlet_tables",
-    "src/models/radar",
-    "src/models/structure",
-    "src/models/thermal",
-    "src/models/warhead",
-    "src/models/warhead/bf_warhead",
-    "src/models/weapondatalink",
-    "src/models/weight",
-    "tools/helpers/",
-    "tools/plotters",
-    "tools/ppt",
-    "tools/datcom_nn",
-]
-os.chdir(r"/home/imoore/misslemdao")
-
-project_dir = Path(__file__).resolve().parent.parent  
-
-for path in paths_to_modules:
-    if str(path) not in sys.path:
-        sys.path.append(str(path))
-
-from dymos_generator import dymos_generator
-
-'''
-This script is designed to help in reducing the amount of major iterations for SNOPT. 
-
-Originally, this was designed by reducing errors for aircraft parameters at various points in
-the trajectory. However, this is not good for future development and  current work, as different input decks 
-expected different behaviors, causing the "tuned" reward or error model to drastically change per deck.
-
-Thus, what we know is that the major iterations is meant to be minimized and that certain values of the 
-initial conditions leads to more successfull outcomes. Rather than "beating around the bush" and "slapping
-on bandaids" and endless runs of "with vs without the driver" to save in computation energy, we will run WITH
-the driver and delievery in these points:
-    - run with driver
-    - to save in compuational energy, run these in parallel
-    - since we know we have some good values, apply a Perturbation Optimization as per run
-        https://www.worldscientific.com/doi/epdf/10.1142/S021759591950009X
-
-'''
-
-class TrajectoryEnv():
-    def __init__(self, input_deck, problem, scenario):
-        super(TrajectoryEnv, self).__init__()
+class TrajectoryEnv:
+    def __init__(self, input_deck):
         self.input_deck = input_deck
-        self.problem = problem
-        self.scenario = scenario
-        self.pose = np.zeros(8, dtype=np.float32)
-        self.action = np.zeros(6, dtype=np.float32)
-        self.h_ideal_term = self.input_deck["trajectory_phases"]["terminal"]["constraints"]["boundary"]["h"]["equals"]
-        self.gam_bound_boost = 0.0
-        self.ts = "traj_vehicle_0"        
-    
-    def run(self, case, input_deck):
-        casenum= case[0]
-        alpha1 = case[1]
-        alpha2 = case[2]
-        
-        print(f"Running Trajectory Tests for case: {casenum}")
-        print(f"Processing case data: \n{case}") 
+        self.ts = "traj_vehicle_0"
 
-        problem_name = f'case_{casenum}'
-        p = om.Problem(name=problem_name)
+    # ---------------- keep these AS IS ----------------
+    @staticmethod
+    def _read_text(p: Path) -> str:
+        if not p.exists(): return ""
+        try: return p.read_text(encoding="utf-8", errors="ignore")
+        except Exception: return p.read_bytes().decode("utf-8", errors="ignore")
 
-        scenario = dymos_generator(problem=p, input_deck=input_deck)
-        p.model_options["vehicle_0"]["trajectory_phases"]["boost_11"]["initial_conditions"]["controls"]["alpha"][0] = alpha1
-        p.model_options["vehicle_0"]["trajectory_phases"]["boost_11"]["initial_conditions"]["controls"]["alpha"][1] = alpha2
-        scenario.setup()
+    @staticmethod
+    def _last_major_before_exit(txt: str) -> int | None:
+        # first int on the last data line before SNOPTA/SNOPTC EXIT
+        k = max(txt.rfind("SNOPTA EXIT"), txt.rfind("SNOPTC EXIT"))
+        if k == -1: return None
+        for line in reversed(txt[:k].splitlines()):
+            s = line.strip()
+            if not s: continue
+            m = re.match(r"\s*(\d+)\b", s)
+            if m: return int(m.group(1))
+        return None
+    # --------------------------------------------------
 
-        print("\nRunning Optimality Driver")
-        
+    @staticmethod
+    def _cloud(seed, n_pts, span_frac=(0.25, 0.25), abs_min_span=0.5, bounds=None):
+        """Small deterministic box around seed; Sobol if available, else tiny grid."""
+        a1, a2 = map(float, seed)
+        s1 = max(abs(a1)*span_frac[0], abs_min_span)
+        s2 = max(abs(a2)*span_frac[1], abs_min_span)
+        lo = np.array([a1 - s1, a2 - s2]); hi = np.array([a1 + s1, a2 + s2])
+        pts = [(a1, a2)]
         try:
-            dm.run_problem(scenario.p, run_driver=True, simulate=True, simulate_kwargs={"method": "RK45"})
+            from scipy.stats import qmc
+            eng = qmc.Sobol(d=2, scramble=False)
+            X = eng.random_base2(int(np.ceil(np.log2(n_pts))))[:n_pts]
+            X = qmc.scale(X, lo, hi)
+            pts += [tuple(map(float, x)) for x in X]
+        except Exception:
+            k = max(3, int(np.ceil(np.sqrt(n_pts))))
+            xs = np.linspace(lo[0], hi[0], k); ys = np.linspace(lo[1], hi[1], k)
+            pts += [(float(x), float(y)) for x in xs for y in ys][:n_pts]
+        if bounds:
+            (l1,h1),(l2,h2) = bounds
+            pts = [(x,y) for (x,y) in pts if l1<=x<=h1 and l2<=y<=h2]
+        # de-dup
+        uniq = list(dict.fromkeys([(round(x,12), round(y,12)) for (x,y) in pts]))
+        return [(x,y) for (x,y) in uniq]
 
-            with open(self.problem.get_outputs_dir() / "SNOPT_print.out", encoding="utf-8", errors='ignore') as f:
-                SNOPT_history = f.read()
+    @staticmethod
+    def _eval_alpha_case(case_id, a1, a2, input_deck):
+        """Fresh Problem/scenario → run driver → parse last major → cost."""
+        PENALTY_FAIL = 1e9
+        try:
+            p = om.Problem(name=f"case_{case_id}")
+            deck = copy.deepcopy(input_deck)
+            scen = dymos_generator(problem=p, input_deck=deck)
 
-            # Define where the exit code information starts
-            exit_code_start = SNOPT_history.rfind("SNOPTC EXIT")
-            exit_code_end = SNOPT_history.find("\n", exit_code_start)
+            # set alphas (both places people commonly use)
+            try:
+                scen.p.model_options["vehicle_0"]["trajectory_phases"]["boost_11"]["initial_conditions"]["controls"]["alpha"][0] = float(a1)
+                scen.p.model_options["vehicle_0"]["trajectory_phases"]["boost_11"]["initial_conditions"]["controls"]["alpha"][1] = float(a2)
+            except Exception: pass
+            try:
+                p.model_options["vehicle_0"]["trajectory_phases"]["boost_11"]["initial_conditions"]["controls"]["alpha"][0] = float(a1)
+                p.model_options["vehicle_0"]["trajectory_phases"]["boost_11"]["initial_conditions"]["controls"]["alpha"][1] = float(a2)
+            except Exception: pass
 
-            # Extract the exit code line
-            exit_code = int((SNOPT_history[exit_code_start:exit_code_end]).split()[2])
+            scen.setup()
+            dm.run_problem(scen.p, run_driver=True, simulate=False)
 
-            # TO DO: fix this tomatch that of major iterattions, not minor
-            before_exit = SNOPT_history[:exit_code_start].splitlines()
-            last_row_line = before_exit[-1].strip()
-            last_major_iter = int(last_row_line.split()[0])
+            outdir = scen.p.get_outputs_dir()
+            txt = (TrajectoryEnv._read_text(outdir / "SNOPT_summary.out")
+                   or TrajectoryEnv._read_text(outdir / "SNOPT_print.out"))
+            last_major = TrajectoryEnv._last_major_before_exit(txt) if txt else None
+            return float(last_major) if last_major is not None else PENALTY_FAIL
+        except Exception:
+            return PENALTY_FAIL
 
-            print("Exit code:", exit_code)
-            print("Last major iteration:", last_major_iter)
-            return last_major_iter
+    def perturb_optimize(self, seed_alphas, *, rounds=3, per_round=10,
+                         span_schedule=(0.5, 0.25, 0.1),
+                         bounds=None, abs_min_span=0.5):
+        """Serial, shrinking-box perturbation. Returns (best_alphas, best_cost)."""
+        assert rounds == len(span_schedule)
+        best = (float(seed_alphas[0]), float(seed_alphas[1]))
+        best_cost = self._eval_alpha_case(0, best[0], best[1], self.input_deck)
 
-        except Exception as e:
-            print(f"Error during trajectory test for case {casenum}: {e}")
-            return None
+        cid = 1
+        for r in range(rounds):
+            frac = span_schedule[r]
+            cand = self._cloud(best, n_pts=per_round, span_frac=(frac, frac),
+                               abs_min_span=abs_min_span, bounds=bounds)
+            for (a1,a2) in cand[1:]:   # skip seed
+                cost = self._eval_alpha_case(cid, a1, a2, self.input_deck)
+                cid += 1
+                if cost < best_cost:
+                    best_cost, best = cost, (a1, a2)
+        return best, best_cost
+env = TrajectoryEnv(input_deck)
 
-    def make_noise():
-        return cases?
-    def run_parallel_envs(self, 
-        input_deck: dict,
-        seed_alphas: tuple[float, float],
-        *,
-        n_candidates: int = 24,
-        bounds: tuple[tuple[float, float], tuple[float, float]] | None = None,
-        method: str = "sobol",
-        max_workers: int = 8,
-        logdir: Path = Path("snopt_logs")
-        ):
-        '''
-        Executes the optimization process using the Nelder-Mead method. Identifies optimal control parameters.
-        '''
+seed = tuple(input_deck["trajectory_phases"]["boost_11"]["initial_conditions"]["controls"]["alpha"])  # e.g., (0.0, 5.0)
 
-        print("Stepping...")
+best_alphas, best_cost = env.perturb_optimize(
+    seed_alphas=seed,
+    rounds=3,
+    per_round=12,
+    span_schedule=(0.5, 0.25, 0.1),     # shrink each round
+    bounds=[(-5.0, 5.0), (0.0, 10.0)],  # clamp to valid values
+    abs_min_span=0.5,                   # makes α1 explore even if seed is 0.0
+)
 
-        self.update_state()
-        num_processors = 28
-        with multiprocessing.Pool(processes=num_processors) as pool:
-            print("Created pool...")
-            # Map the function to the list of traj doe values
-            task_partial = partial(run, input_deck=input_deck)
-            results = pool.map(task_partial, cases)
-
-        print("Results finished...")
-        pool.close()
-        pool.join()
+print("best alphas:", best_alphas, "min major iters:", best_cost)
