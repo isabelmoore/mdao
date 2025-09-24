@@ -171,7 +171,7 @@ class TrajectoryEnv():
             return None
 
     def make_noise():
-        return 
+        return cases?
     def run_parallel_envs(self, 
         input_deck: dict,
         seed_alphas: tuple[float, float],
@@ -191,7 +191,13 @@ class TrajectoryEnv():
         print("Stepping...")
 
         self.update_state()
-        
-        initial_guess = [self.alpha_boost_1, self.alpha_boost_2]
-        result = minimize(self.run, initial_guess, method='Nelder-Mead', tol=1e-3, options={'maxiter': 100})
-        self.actions = np.array(result.x, dtype=np.float32).flatten()
+        num_processors = 28
+        with multiprocessing.Pool(processes=num_processors) as pool:
+            print("Created pool...")
+            # Map the function to the list of traj doe values
+            task_partial = partial(run, input_deck=input_deck)
+            results = pool.map(task_partial, cases)
+
+        print("Results finished...")
+        pool.close()
+        pool.join()
