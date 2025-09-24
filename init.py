@@ -87,43 +87,12 @@ class TrajectoryEnv():
         self.action = np.zeros(6, dtype=np.float32)
         self.h_ideal_term = self.input_deck["trajectory_phases"]["terminal"]["constraints"]["boundary"]["h"]["equals"]
         self.gam_bound_boost = 0.0
-        self.ts = "traj_vehicle_0"
-        self.alpha_boost_1 = self.input_deck["trajectory_phases"]["boost_11"]["initial_conditions"]["controls"]["alpha"][0]
-        self.alpha_boost_2 = self.input_deck["trajectory_phases"]["boost_11"]["initial_conditions"]["controls"]["alpha"][1]
-        print(f"initial: {self.alpha_boost_1, self.alpha_boost_2}")
-        
-    def update_state(self):
-        '''
-        Updates pose with metrics from terminal and boost phases
-        '''
-
-        try:
-            h_boost_min = float(min(self.problem.get_val(f"{self.ts}.phases.boost_11.timeseries.h", units="m")))
-            range_boost = float(self.problem.get_val(f"{self.ts}.phases.boost_11.timeseries.range", units="m")[-1])
-
-            self.pose = [h_boost_min, range_boost]
-        except Exception as e:
-            print(f"[ERROR] Failed to update state: {e}")  
-
-    def run(self):
-        '''
-        Computes penalties based on trajectory metrics
-        '''
-
-        print()
-        print("Rewarding...")
-        scenario = self.scenario
-        problem = self.problem
-
-        dm.run_problem(scenario.problem, run_driver=True, simulate=False)
-        # om.n2(scenario.p, outfile="n2_post_run.html")
-
-
+        self.ts = "traj_vehicle_0"        
     
     def run(self, case, input_deck):
         casenum= case[0]
-        azimuth= case[1]
-        range_ = case[2]
+        alpha1 = case[1]
+        alpha2 = case[2]
         
         print(f"Running Trajectory Tests for case: {casenum}")
         print(f"Processing case data: \n{case}") 
@@ -132,14 +101,8 @@ class TrajectoryEnv():
         p = om.Problem(name=problem_name)
 
         scenario = dymos_generator(problem=p, input_deck=input_deck)
-        scenario.p.model_options["vehicle_0"]["trajectory_phases"]["terminal"]["constraints"]["boundary"]["azimuth"]["equals"] = azimuth
-        scenario.p.model_options["vehicle_0"]["trajectory_phases"]["terminal"]["constraints"]["boundary"]["range"]["equals"] = range_
-
-        scenario.p.model_options["vehicle_0"]["trajectory_phases"]["boost_11"]["initial_conditions"]["controls"]["bank"][0] = azimuth / 2
-        scenario.p.model_options["vehicle_0"]["trajectory_phases"]["boost_11"]["initial_conditions"]["controls"]["bank"][1] = azimuth / 2
-        scenario.p.model_options["vehicle_0"]["trajectory_phases"]["terminal"]["initial_conditions"]["controls"]["bank"][0] = azimuth / 2
-        scenario.p.model_options["vehicle_0"]["trajectory_phases"]["terminal"]["initial_conditions"]["controls"]["bank"][1] = azimuth / 2
-
+        p.model_options["vehicle_0"]["trajectory_phases"]["boost_11"]["initial_conditions"]["controls"]["alpha"][0] = alpha1
+        p.model_options["vehicle_0"]["trajectory_phases"]["boost_11"]["initial_conditions"]["controls"]["alpha"][1] = alpha2
         scenario.setup()
 
         print("\nRunning Optimality Driver")
@@ -186,8 +149,6 @@ class TrajectoryEnv():
         Executes the optimization process using the Nelder-Mead method. Identifies optimal control parameters.
         '''
 
-        
-        
         print("Stepping...")
 
         self.update_state()
