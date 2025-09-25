@@ -26,8 +26,6 @@ import scipy.stats.qmc as qmc
 import pandas as pd
 from itertools import product
 import sqlite3
-import multiprocessing as mp 
-from functools import partial
 
 paths_to_modules = [
     "scenarios",
@@ -51,10 +49,7 @@ paths_to_modules = [
     "tools/ppt",
     "tools/datcom_nn",
 ]
-import os
-print(os.path.dirname(os.path.realpath(__file__)))
-os.chdir(r"C:\Users\N81446\misslemdao")
-print(os.path.dirname(os.path.realpath(__file__)))
+os.chdir(r"/home/imoore/misslemdao")
 
 project_dir = Path(__file__).resolve().parent.parent  
 
@@ -64,149 +59,108 @@ for path in paths_to_modules:
 
 from dymos_generator import dymos_generator
 
-# ---------- case builder: simple grid around seed ----------
-def build_alpha_cases(seed_a1, seed_a2, n1=3, n2=3, span1=1.0, span2=1.0, bounds=None):
-    a1_vals = np.linspace(seed_a1 - span1, seed_a1 + span1, n1)
-    a2_vals = np.linspace(seed_a2 - span2, seed_a2 + span2, n2)
-    cases, cid = [], 0
-    for a1 in a1_vals:
-        for a2 in a2_vals:
-            if bounds:
-                (L1,H1),(L2,H2) = bounds
-                if not (L1 <= a1 <= H1 and L2 <= a2 <= H2): continue
-            cases.append((cid, float(a1), float(a2)))
-            cid += 1
-    return cases
+'''
+This script is designed to help in reducing the amount of major iterations for SNOPT. 
 
-# ---------- worker: build fresh Problem, run, parse major iterations ----------
-def run_alpha_case(case_tuple, input_deck):
-    cid, a1, a2 = case_tuple
-    try:
-        print("1")
-        p = om.Problem(name=f"case_{cid}")
-        deck = copy.deepcopy(input_deck)
-        scen = dymos_generator(problem=p, input_deck=deck)
+Originally, this was designed by reducing errors for aircraft parameters at various points in
+the trajectory. However, this is not good for future development and  current work, as different input decks 
+expected different behaviors, causing the "tuned" reward or error model to drastically change per deck.
 
-        # set alphas (where your generator reads them)
-        try:
-            print("2")
+Thus, what we know is that the major iterations is meant to be minimized and that certain values of the 
+initial conditions leads to more successfull outcomes. Rather than "beating around the bush" and "slapping
+on bandaids" and endless runs of "with vs without the driver" to save in computation energy, we will run WITH
+the driver and delievery in these points:
+    - run with driver
+    - to save in compuational energy, run these in parallel
+    - since we know we have some good values, apply a Perturbation Optimization as per run
+        https://www.worldscientific.com/doi/epdf/10.1142/S021759591950009X
 
-            scen.p.model_options["vehicle_0"]["trajectory_phases"]["boost_11"]["initial_conditions"]["controls"]["alpha"][0] = a1
-            scen.p.model_options["vehicle_0"]["trajectory_phases"]["boost_11"]["initial_conditions"]["controls"]["alpha"][1] = a2
-        except Exception:
-            print("3")
+'''
 
-            pass
-        try:
-            print("4")
-
-            p.model_options["vehicle_0"]["trajectory_phases"]["boost_11"]["initial_conditions"]["controls"]["alpha"][0] = a1
-            p.model_options["vehicle_0"]["trajectory_phases"]["boost_11"]["initial_conditions"]["controls"]["alpha"][1] = a2
-        except Exception:
-            print("5")
-
-            pass
-
-        scen.setup()
-        dm.run_problem(scen.p, run_driver=True, simulate=False)
-
-        # read SNOPT logs from THIS run
-        outdir = scen.p.get_outputs_dir()
-
-        txt = (outdir/"SNOPT_print.out").read_text(encoding="utf-8", errors="ignore")
-        print("txt:",txt)
-        # parse last major iteration (row before EXIT)
-        last_major = None
-        if txt:
-            k = max(txt.rfind("SNOPTA EXIT"), txt.rfind("SNOPTC EXIT"))
-            print(k)
-            if k != -1:
-                pre = txt[:k].splitlines()
-                print(pre)
-                for line in reversed(pre):
-                    s = line.strip()
-                    if not s: continue
-                    m = re.match(r"\s*(\d+)\b", s)
-                    if m:
-                        last_major = int(m.group(1))
-                        break
-
-        return (cid, last_major)
-
-    except Exception as e:
-        print(f"Error during trajectory test for case {cid}: {e}")
-        return (cid, None)
-
-# ---------- main ----------
-def main(n1=3, n2=3, span1=1.0, span2=1.0, processes=4):
-    # load deck
-    print("YESSS", os.getcwd())
-
-    input_deck_path = os.path.join(os.getcwd(), "scenarios/input_decks/", "one_stage_one_pulse_traj_ann.yml")
-    print(input_deck_path)
-    with open(input_deck_path, "r") as f:
-        input_deck = safe_load(f)
+class TrajectoryEnv():
+    def __init__(self, input_deck, problem, scenario):
+        super(TrajectoryEnv, self).__init__()
+        self.input_deck = input_deck
+        self.problem = problem
+        self.scenario = scenario
+        self.pose = np.zeros(8, dtype=np.float32)
+        self.action = np.zeros(6, dtype=np.float32)
+        self.h_ideal_term = self.input_deck["trajectory_phases"]["terminal"]["constraints"]["boundary"]["h"]["equals"]
+        self.gam_bound_boost = 0.0
+        self.ts = "traj_vehicle_0"        
     
-    print(input_deck)
+    def run(self, case, input_deck):
+        casenum= case[0]
+        alpha1 = case[1]
+        alpha2 = case[2]
+        
+        print(f"Running Trajectory Tests for case: {casenum}")
+        print(f"Processing case data: \n{case}") 
 
-    # seed alphas from deck
-    seed_alpha = input_deck["trajectory_phases"]["boost_11"]["initial_conditions"]["controls"]["alpha"]
-    seed_a1, seed_a2 = float(seed_alpha[0]), float(seed_alpha[1])
+        problem_name = f'case_{casenum}'
+        p = om.Problem(name=problem_name)
 
-    # build cases
-    bounds = [(-5.0, 5.0), (0.0, 10.0)]  # optional clamp
-    cases = build_alpha_cases(seed_a1, seed_a2, n1=n1, n2=n2, span1=span1, span2=span2, bounds=bounds)
-    print(f"Built {len(cases)} cases around seed ({seed_a1}, {seed_a2})")
+        scenario = dymos_generator(problem=p, input_deck=input_deck)
+        p.model_options["vehicle_0"]["trajectory_phases"]["boost_11"]["initial_conditions"]["controls"]["alpha"][0] = alpha1
+        p.model_options["vehicle_0"]["trajectory_phases"]["boost_11"]["initial_conditions"]["controls"]["alpha"][1] = alpha2
+        scenario.setup()
 
-    # run parallel
-    with mp.Pool(processes=processes) as pool:
-        results = pool.map(partial(run_alpha_case, input_deck=input_deck), cases)
+        print("\nRunning Optimality Driver")
+        
+        try:
+            dm.run_problem(scenario.p, run_driver=True, simulate=True, simulate_kwargs={"method": "RK45"})
 
-    # print ONLY iterations
-    results.sort(key=lambda t: t[0])  # by case id
-    print("\nSNOPT major iterations per case:")
-    for cid, iters in results:
-        print(f"case {cid}: {iters}")
+            with open(self.problem.get_outputs_dir() / "SNOPT_print.out", encoding="utf-8", errors='ignore') as f:
+                SNOPT_history = f.read()
 
-if __name__ == "__main__":
-    # Example: 3x3 grid, ±1.0 around each alpha, 4 workers
-    main(n1=3, n2=3, span1=1.0, span2=1.0, processes=4)
+            # Define where the exit code information starts
+            exit_code_start = SNOPT_history.rfind("SNOPTC EXIT")
+            exit_code_end = SNOPT_history.find("\n", exit_code_start)
 
+            # Extract the exit code line
+            exit_code = int((SNOPT_history[exit_code_start:exit_code_end]).split()[2])
 
-: [0.5, 0.5, 0.5], 'opt': False, 'units': None}, 'LMAXL': {'val': [0.5, 0.5, 0.5], 'opt': False, 'units': None}, 'LFLATU': {'val': [0.0, 0.0, 0.0], 'opt': False, 'units': None}, 'LFLATL': {'val': [0.0, 0.0, 0.0], 'opt': False, 'units': None}}}}}
-Built 9 cases around seed (0.0, 9.0)
-C:\Users\N81446\misslemdao\tools\traj_ann\init_cond_opt
-C:\Users\N81446\misslemdao\tools\traj_ann\init_cond_opt
-C:\Users\N81446\misslemdao\tools\traj_ann\init_cond_opt
-C:\Users\N81446\misslemdao\tools\traj_ann\init_cond_opt
-1
-C:\Users\N81446\misslemdao\tools\traj_ann\init_cond_opt
-C:\Users\N81446\misslemdao\tools\traj_ann\init_cond_opt
-Error during trajectory test for case 0: No module named 'scenarios'
-1
-Error during trajectory test for case 1: No module named 'scenarios'
-1
-Error during trajectory test for case 2: No module named 'scenarios'
-1
-Error during trajectory test for case 3: No module named 'scenarios'
-1
-Error during trajectory test for case 4: No module named 'scenarios'
-1
-Error during trajectory test for case 5: No module named 'scenarios'
-1
-Error during trajectory test for case 6: No module named 'scenarios'
-1
-Error during trajectory test for case 7: No module named 'scenarios'
-1
-Error during trajectory test for case 8: No module named 'scenarios'
+            # TO DO: fix this tomatch that of major iterattions, not minor
+            before_exit = SNOPT_history[:exit_code_start].splitlines()
+            last_row_line = before_exit[-1].strip()
+            last_major_iter = int(last_row_line.split()[0])
 
-SNOPT major iterations per case:
-case 0: None
-case 1: None
-case 2: None
-case 3: None
-case 4: None
-case 5: None
-case 6: None
-case 7: None
-case 8: None
+            print("Exit code:", exit_code)
+            print("Last major iteration:", last_major_iter)
+            return last_major_iter
+
+        except Exception as e:
+            print(f"Error during trajectory test for case {casenum}: {e}")
+            return None
+
+    def make_noise():
+
+        
+        return cases?
+    def run_parallel_envs(self, 
+        input_deck: dict,
+        seed_alphas: tuple[float, float],
+        *,
+        n_candidates: int = 24,
+        bounds: tuple[tuple[float, float], tuple[float, float]] | None = None,
+        method: str = "sobol",
+        max_workers: int = 8,
+        logdir: Path = Path("snopt_logs")
+        ):
+        '''
+        Executes the optimization process using the Nelder-Mead method. Identifies optimal control parameters.
+        '''
+
+        print("Stepping...")
+
+        self.update_state()
+        num_processors = 28
+        with multiprocessing.Pool(processes=num_processors) as pool:
+            print("Created pool...")
+            # Map the function to the list of traj doe values
+            task_partial = partial(run, input_deck=input_deck)
+            results = pool.map(task_partial, cases)
+
+        print("Results finished...")
+        pool.close()
+        pool.join()
