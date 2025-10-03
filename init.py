@@ -3,6 +3,54 @@ import numpy as np
 from typing import Tuple, Dict, Any, List
 from bayes_opt import BayesianOptimization, UtilityFunction
 
+
+# phase 0: creating region
+class LatinHypercube:
+    def __init__(self):
+        super().__init__()
+
+    def create_matrix(self):
+
+class GridSampling:
+    def __init__(self):
+        super().__init__()
+
+    def create_matrix(self):
+
+
+# phase 2: adjusting search based on the feasibility region
+class Bayesian:
+    def __init__(self):
+        super().__init__()
+
+ 
+
+
+# phase 1: finding feasibility region
+class TrajectoryEnv: 
+    self.input_deck = input_deck
+    self.problem = problem
+    self.scenario = scenario
+    self.ts = "traj_vehicle_0"
+
+    self.init_params = {
+        "boost_alpha_0": 
+            "bounds": (-30, 30), 
+            "timeseries": self.input_deck["trajectory_phases"]["boost_11"]["initial_conditions"]["controls"]["alpha"][0],            
+        "boost_alpha_1": 
+            "bounds": (-30, 30), 
+            "timeseries": self.input_deck["trajectory_phases"]["boost_11"]["initial_conditions"]["controls"]["alpha"][1],       
+        }
+
+    self.success_log = []
+    self.best_params = []
+    self.best range = 
+
+
+
+
+# ------------------------------------------------------------------------------------------------
+# example
 # ----------------------------
 # Your environment (feasible-or-not + range)
 # ----------------------------
