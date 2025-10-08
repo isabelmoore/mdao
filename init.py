@@ -1,212 +1,294 @@
-# bo_traj_opt.py
+# mixed_search.py
+from __future__ import annotations
+from itertools import product
+from typing import Dict, List, Tuple, Iterable, Callable, Any
 import numpy as np
-from typing import Tuple, Dict, Any, List
-from bayes_opt import BayesianOptimization, UtilityFunction
+
+# Optional: pip install bayesian-optimization
+try:
+    from bayes_opt import BayesianOptimization
+    HAS_BO = True
+except Exception:
+    HAS_BO = False
 
 
-# phase 0: creating region
-class LatinHypercube:
-    def __init__(self):
-        super().__init__()
-
-    def create_matrix(self):
+# =========================
+# Samplers
+# =========================
 
 class GridSampling:
-    def __init__(self):
-        super().__init__()
+    """
+    Exhaustive grid over categorical variables.
+    Example config:
+        cat_space = {
+            "tire_type": ["soft", "medium", "hard"],
+            "guidance": ["A", "B"]
+        }
+    """
+    def __init__(self, cat_space: Dict[str, List[Any]]):
+        self.cat_space = cat_space
+        self.keys = list(cat_space.keys())
+        self._grid = list(product(*[cat_space[k] for k in self.keys]))
 
-    def create_matrix(self):
+    def __iter__(self) -> Iterable[Dict[str, Any]]:
+        for combo in self._grid:
+            yield {k: v for k, v in zip(self.keys, combo)}
+
+    def __len__(self) -> int:
+        return len(self._grid)
 
 
-# phase 2: adjusting search based on the feasibility region
+class LatinHypercube:
+    """
+    Simple LHS for numeric warm-starts.
+    bounds: dict name -> (lo, hi)
+    n: number of samples
+    """
+    def __init__(self, bounds: Dict[str, Tuple[float, float]], n: int, seed: int = 0):
+        self.bounds = bounds
+        self.n = n
+        self.seed = seed
+
+    def samples(self) -> List[Dict[str, float]]:
+        rng = np.random.default_rng(self.seed)
+        names = list(self.bounds.keys())
+        dim = len(names)
+
+        # Stratify each dimension
+        cut = np.linspace(0, 1, self.n + 1)
+        u = rng.random((self.n, dim))
+        pts01 = (cut[:-1] + u * (cut[1:] - cut[:-1]))  # n x dim
+
+        # Randomly permute per dimension
+        for j in range(dim):
+            rng.shuffle(pts01[:, j])
+
+        # Scale to bounds
+        out = []
+        for i in range(self.n):
+            row = {}
+            for j, name in enumerate(names):
+                lo, hi = self.bounds[name]
+                row[name] = lo + pts01[i, j] * (hi - lo)
+            out.append(row)
+        return out
+
+
 class Bayesian:
-    def __init__(self):
-        super().__init__()
+    """
+    Thin wrapper around `bayesian-optimization` for numeric params.
+    Uses the "penalty trick": objective returns large negative when infeasible,
+    otherwise returns the scalar we want to maximize (here: `range_final`).
+    """
+    def __init__(
+        self,
+        bounds: Dict[str, Tuple[float, float]],
+        init_points: int = 12,
+        n_iter: int = 60,
+        random_state: int = 42,
+        acq: str = "ei",
+        xi: float = 0.01,
+        penalty: float = -1e9,
+    ):
+        if not HAS_BO:
+            raise RuntimeError(
+                "bayesian-optimization not installed. `pip install bayesian-optimization`"
+            )
+        self.bounds = bounds
+        self.init_points = init_points
+        self.n_iter = n_iter
+        self.random_state = random_state
+        self.acq = acq
+        self.xi = xi
+        self.penalty = penalty
 
- 
+    def run(
+        self,
+        objective: Callable[[Dict[str, float]], float],
+        warm_starts: List[Dict[str, float]] | None = None,
+        verbose: int = 2,
+    ) -> Tuple[Dict[str, float], float]:
+        # Make pbounds
+        pbounds = {k: (float(lo), float(hi)) for k, (lo, hi) in self.bounds.items()}
+
+        # Wrap objective for bayes_opt signature f(x1, x2, ...)
+        names = list(self.bounds.keys())
+
+        def f_wrapped(**kwargs):
+            # kwargs contains names -> value
+            x = {k: float(kwargs[k]) for k in names}
+            val = objective(x)
+            return float(val)
+
+        opt = BayesianOptimization(
+            f=f_wrapped,
+            pbounds=pbounds,
+            random_state=self.random_state,
+            verbose=verbose,
+        )
+
+        # If warm starts are provided, register them
+        if warm_starts:
+            for ws in warm_starts:
+                y = objective(ws)
+                opt.register(params=ws, target=float(y))
+
+        # Random init + guided
+        if self.init_points > 0:
+            opt.maximize(init_points=self.init_points, n_iter=0, acq=self.acq, xi=self.xi)
+        if self.n_iter > 0:
+            opt.maximize(n_iter=self.n_iter, acq=self.acq, xi=self.xi)
+
+        best = opt.max
+        return best["params"], float(best["target"])
 
 
-# phase 1: finding feasibility region
-class TrajectoryEnv: 
-    self.input_deck = input_deck
-    self.problem = problem
-    self.scenario = scenario
-    self.ts = "traj_vehicle_0"
+# =========================
+# Trajectory wrapper (your env)
+# =========================
 
-    self.init_params = {
-        "boost_alpha_0": 
-            "bounds": (-30, 30), 
-            "timeseries": self.input_deck["trajectory_phases"]["boost_11"]["initial_conditions"]["controls"]["alpha"][0],            
-        "boost_alpha_1": 
-            "bounds": (-30, 30), 
-            "timeseries": self.input_deck["trajectory_phases"]["boost_11"]["initial_conditions"]["controls"]["alpha"][1],       
+class Trajectory:
+    """
+    Orchestrates:
+      - categorical grid search
+      - numeric Bayesian optimization per categorical combo
+    You provide:
+      - set_categoricals: how to apply categorical settings to the sim
+      - evaluate_numeric: given numeric dict, run once and return (feasible, range_final)
+    """
+    def __init__(
+        self,
+        set_categoricals: Callable[[Dict[str, Any]], None],
+        evaluate_numeric: Callable[[Dict[str, float]], Tuple[bool, float]],
+    ):
+        self.set_categoricals = set_categoricals
+        self.evaluate_numeric = evaluate_numeric
+
+    def optimize(
+        self,
+        cat_space: Dict[str, List[Any]],
+        num_bounds: Dict[str, Tuple[float, float]],
+        lhs_warmup: int = 10,
+        bo_init_points: int = 12,
+        bo_iters: int = 60,
+        seed: int = 0,
+    ) -> Dict[str, Any]:
+        grid = GridSampling(cat_space)
+        lhs = LatinHypercube(num_bounds, n=lhs_warmup, seed=seed)
+        warm = lhs.samples() if lhs_warmup > 0 else []
+
+        best_overall = {
+            "cat": None,
+            "num": None,
+            "range": -np.inf,
+        }
+        per_combo_results = []
+
+        # Iterate over ALL categorical combinations
+        for cat_combo in grid:
+            # Apply categoricals to the environment
+            self.set_categoricals(cat_combo)
+
+            # Define BO objective: returns range (maximize) if feasible; large negative otherwise
+            def objective(xnum: Dict[str, float]) -> float:
+                feasible, rng = self.evaluate_numeric(xnum)
+                return float(rng) if (feasible and np.isfinite(rng)) else -1e9
+
+            # Run BO for this categorical combo
+            bo = Bayesian(
+                bounds=num_bounds,
+                init_points=bo_init_points,
+                n_iter=bo_iters,
+                random_state=seed,
+                acq="ei",
+                xi=0.01,
+                penalty=-1e9,
+            )
+            best_num, best_val = bo.run(objective, warm_starts=warm, verbose=1)
+
+            per_combo_results.append({
+                "categoricals": cat_combo,
+                "best_numeric": best_num,
+                "best_range": best_val,
+            })
+
+            if best_val > best_overall["range"]:
+                best_overall = {
+                    "cat": cat_combo,
+                    "num": best_num,
+                    "range": best_val,
+                }
+
+        return {
+            "best_overall": best_overall,
+            "per_combo": per_combo_results,
         }
 
-    self.success_log = []
-    self.best_params = []
-    self.best range = 
 
+# =========================
+# Example wiring
+# =========================
 
+# You’ll adapt these two functions to your real environment.
 
-
-# ------------------------------------------------------------------------------------------------
-# example
-# ----------------------------
-# Your environment (feasible-or-not + range)
-# ----------------------------
-class TrajectoryEnv:
-    def __init__(self, input_deck, problem, scenario):
-        super().__init__()
-        self.input_deck = input_deck
-        self.problem = problem
-        self.scenario = scenario
-
-        self.ts = "traj_vehicle_0"
-        self.alpha_boost_1 = float(
-            self.input_deck["trajectory_phases"]["boost_11"]["initial_conditions"]["controls"]["alpha"][0]
-        )
-        self.alpha_boost_2 = float(
-            self.input_deck["trajectory_phases"]["boost_11"]["initial_conditions"]["controls"]["alpha"][1]
-        )
-        print(f"[init] alpha_boost = ({self.alpha_boost_1:.6g}, {self.alpha_boost_2:.6g})")
-
-        # TODO: set realistic bounds for your two alphas (radians or degrees — match your deck!)
-        self.alpha_bounds = [
-            (-30.0 * np.pi / 180.0, 30.0 * np.pi / 180.0),  # alpha_boost_1
-            (-30.0 * np.pi / 180.0, 30.0 * np.pi / 180.0),  # alpha_boost_2
-        ]
-
-        self.success_log: List[Dict[str, float]] = []
-        self.best_params = np.array([self.alpha_boost_1, self.alpha_boost_2], dtype=float)
-        self.best_range = -np.inf
-
-    # ---- low-level helpers ----
-    def _clip(self, params):
-        out = []
-        for (lo, hi), v in zip(self.alpha_bounds, params):
-            out.append(float(np.clip(v, lo, hi)))
-        return np.array(out, dtype=float)
-
-    def _set_params(self, params):
-        a1, a2 = map(float, params)
-        self.alpha_boost_1, self.alpha_boost_2 = a1, a2
-        alpha_arr = self.problem.model_options["vehicle_0"]["trajectory_phases"]["boost_11"]["initial_conditions"]["controls"]["alpha"]
-        alpha_arr[0] = a1
-        alpha_arr[1] = a2
-
-    def _get_metrics(self) -> Tuple[float, float]:
-        """Return (h_min, range_final). Only call after a successful setup."""
-        h_ts = self.problem.get_val(f"{self.ts}.phases.boost_11.timeseries.h", units="m")
-        r_ts = self.problem.get_val(f"{self.ts}.phases.boost_11.timeseries.range", units="m")
-        h_min = float(np.min(h_ts))
-        range_final = float(r_ts[-1])
-        return h_min, range_final
-
-    # ---- the only contract BO needs ----
-    def evaluate(self, params) -> Tuple[bool, float]:
-        """
-        Try params once.
-        Returns:
-          (success_flag, range_if_success_else_-inf)
-        """
-        params = self._clip(params)
-        try:
-            self._set_params(params)
-            self.scenario.setup()  # your heavy reconfigure + model run
-            h_min, range_final = self._get_metrics()
-
-            feasible = np.isfinite(range_final) and (range_final > 0.0) and np.isfinite(h_min)
-            if feasible:
-                self.success_log.append({"a1": params[0], "a2": params[1], "range": range_final})
-                if range_final > self.best_range:
-                    self.best_range = range_final
-                    self.best_params = params.copy()
-                return True, range_final
-            else:
-                return False, float("-inf")
-        except Exception:
-            # If the run throws (e.g., ODE blow-up, constraint violation), count as infeasible
-            return False, float("-inf")
-
-
-# ----------------------------
-# BO wrapper (penalty trick)
-# ----------------------------
-def run_bo_on_env(
-    env: TrajectoryEnv,
-    init_points: int = 12,
-    n_iter: int = 60,
-    random_state: int = 42,
-    acq_kind: str = "ei",     # 'ei' | 'ucb' | 'poi'
-    kappa: float = 2.576,     # for UCB
-    xi: float = 0.0           # for EI/POI
-) -> Dict[str, Any]:
+def set_categoricals_in_env(cat_cfg: Dict[str, Any]) -> None:
     """
-    Maximizes final range among feasible runs by penalizing failures.
+    Example: push categoricals into your OpenMDAO deck/problem.
+    Replace with your real plumbing, e.g.:
+       problem.model_options["vehicle_0"]["tire_type"] = cat_cfg["tire_type"]
     """
+    # --- USER: IMPLEMENT THIS ---
+    # e.g. env.set_option("tire_type", cat_cfg["tire_type"])
+    pass
 
-    # Unpack bounds for the bayes_opt API
-    (lo1, hi1), (lo2, hi2) = env.alpha_bounds
-    pbounds = {"alpha1": (lo1, hi1), "alpha2": (lo2, hi2)}
 
-    # Objective the optimizer sees: big negative when infeasible, 'range' otherwise
-    def objective(alpha1: float, alpha2: float) -> float:
-        ok, r = env.evaluate([alpha1, alpha2])
-        return (float(r) if ok and np.isfinite(r) else -1e9)
+def evaluate_numeric_once(xnum: Dict[str, float]) -> Tuple[bool, float]:
+    """
+    One sim run:
+      - Set numeric params (e.g., alphas)
+      - Try scenario.setup()
+      - If it runs, pull range_final, return (True, range_final)
+      - If it fails/throws, return (False, -inf)
+    """
+    try:
+        # --- USER: set numbers ---
+        # env.set_alpha1(xnum["alpha1"]); env.set_alpha2(xnum["alpha2"]); ...
+        # env.scenario.setup()
+        # range_final = env.get_val("...range")[-1]
+        # return True, float(range_final)
+        raise NotImplementedError  # remove when you implement
+    except Exception:
+        return False, float("-inf")
 
-    optimizer = BayesianOptimization(
-        f=objective,
-        pbounds=pbounds,
-        random_state=random_state,
-        verbose=2,  # 0 silent, 1 minimal, 2 all
-    )
 
-    # Optional: control acquisition explicitly
-    util = UtilityFunction(kind=acq_kind, kappa=kappa, xi=xi)
-
-    # Phase 0: a bit of random exploration to find feasibility
-    optimizer.maximize(init_points=init_points, n_iter=0, acq=acq_kind, kappa=kappa, xi=xi)
-
-    # Phase 2: BO iterations (guided)
-    optimizer.maximize(n_iter=n_iter, acq=acq_kind, kappa=kappa, xi=xi)
-
-    best = optimizer.max  # {'target': best_range_or_penalty, 'params': {'alpha1':..., 'alpha2':...}}
-
-    # In case best['target'] was penalized (unlikely after iterations), fall back to env.best_*
-    best_range = best["target"]
-    best_params = (best["params"]["alpha1"], best["params"]["alpha2"])
-
-    if not np.isfinite(best_range) or best_range <= -1e8:
-        best_range = env.best_range
-        best_params = tuple(env.best_params.tolist())
-
-    return {
-        "best_params": best_params,
-        "best_range": best_range,
-        "success_log": env.success_log,  # list of dicts
-        "optimizer": optimizer,
+if __name__ == "__main__":
+    # Define categorical space (exhaustive search)
+    cat_space = {
+        "tire_type": ["soft", "medium", "hard"],
+        "guidance": ["A", "B"],
+        # add more categorical knobs here
     }
 
+    # Define numeric bounds (BO over these)
+    num_bounds = {
+        "alpha1": (-30.0*np.pi/180.0, 30.0*np.pi/180.0),
+        "alpha2": (-30.0*np.pi/180.0, 30.0*np.pi/180.0),
+        # add more numeric knobs here
+    }
 
-# ----------------------------
-# Example integration hook
-# ----------------------------
-def train(input_deck, problem, scenario):
-    """
-    Create env, run BO, return best alphas and the success log for analysis.
-    """
-    env = TrajectoryEnv(input_deck, problem, scenario)
-    result = run_bo_on_env(
-        env,
-        init_points=12,  # 10-20 is fine; more if failures are frequent
-        n_iter=60,       # tune to your run budget
-        random_state=42,
-        acq_kind="ei",   # 'ei' is a solid default
-        xi=0.01          # small positive xi encourages mild exploration
+    traj = Trajectory(set_categoricals=set_categoricals_in_env,
+                      evaluate_numeric=evaluate_numeric_once)
+
+    results = traj.optimize(
+        cat_space=cat_space,
+        num_bounds=num_bounds,
+        lhs_warmup=12,        # warm-start samples per combo
+        bo_init_points=8,     # random init evals for BO per combo
+        bo_iters=40,          # BO guided steps per combo
+        seed=42,
     )
 
-    a1, a2 = result["best_params"]
-    print(f"[BO] best_range={result['best_range']:.6g} at (a1={a1:.6g}, a2={a2:.6g})")
-    # Maintain your previous interface if needed:
-    action_vec = np.array([a1, a2, 0, 0, 0, 0], dtype=np.float32)
-    return action_vec, result["success_log"]
+    print("\n=== BEST OVERALL ===")
+    print(results["best_overall"])
+    # You also get per-combo bests:
+    # for r in results["per_combo"]: print(r)
