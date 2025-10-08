@@ -1,51 +1,25 @@
+def run_traj_test(case, input_deck)
 
-class LatinHypercube:
-    """
-    Latin Hypercube Sampler for NumericSpec objects.
+    for i in range(len(input_params)):
+        casenum = case[0]
+        input_param[i] = case[i]
 
-    Usage:
-        lhs = LatinHypercube(numeric_specs, n_samples=16, seed=42)
-        samples = lhs.sample()  # joint samples across all variables
+    print(f"Running Trajectory Tests for case: {casenum}")
+    print(f"Processing case data: \n{case}") 
 
-        # or for independent per-variable sampling
-        per_var = lhs.sample_per_variable()
-    """
+    problem_name = f'case_{casenum}'
+    p = om.Problem(name=problem_name)
 
-    def __init__(self, numeric_specs, n_samples: int, seed: int = 0):
-        self.specs = numeric_specs
-        self.n_samples = n_samples
-        self.rng = np.random.default_rng(seed)
+    scenario = dymos_generator(problem=p, input_deck=input_deck)
+    for i in range(len(input_params)):
+        scenario.p.model_options[input_params[i].deck_path]
 
-    # --- full joint LHS sampling
-    def sample(self) -> list[dict[str, float]]:
-        names = [s.name for s in self.specs]
-        bounds = [s.bounds for s in self.specs]
-        d = len(self.specs)
+    scenario.setup()
 
-        cut = np.linspace(0, 1, self.n_samples + 1)
-        u = self.rng.random((self.n_samples, d))
-        pts01 = cut[:-1, None] + u * (cut[1:, None] - cut[:-1, None])
+    
+    try:     
+        dm.run_problem(scenario.p, run_driver=True, simulate=False, restart=r"/home/imoore/misslemdao/tools/traj_ann/dymos_solution.db")
+        # om.n2(scenario.p, outfile="n2_post_run.html")
 
-        # shuffle each column independently
-        for j in range(d):
-            self.rng.shuffle(pts01[:, j])
-
-        samples = []
-        for i in range(self.n_samples):
-            row = {}
-            for j, (name, (lo, hi)) in enumerate(zip(names, bounds)):
-                row[name] = float(lo + pts01[i, j] * (hi - lo))
-            samples.append(row)
-        return samples
-
-    # --- independent LHS per variable
-    def sample_per_variable(self) -> dict[str, list[float]]:
-        results = {}
-        for spec in self.specs:
-            lo, hi = spec.bounds
-            cut = np.linspace(0, 1, self.n_samples + 1)
-            u = self.rng.random(self.n_samples)
-            pts01 = cut[:-1] + u * (cut[1:] - cut[:-1])
-            self.rng.shuffle(pts01)
-            results[spec.name] = [float(lo + p * (hi - lo)) for p in pts01]
-        return results
+        with open(p.get_outputs_dir() / "SNOPT_print.out", encoding="utf-8", errors='ignore') as f:
+            SNOPT_history = f.read()
