@@ -1,151 +1,73 @@
-# phase 1: finding feasibility region (wrapper)
-def run_traj_test(case, input_deck, input_params):
-    # Retrieve case number.
-    casenum = case[0]
-    print(f"Running Trajectory Tests for case: {casenum}")
-    print(f"Processing case data: {case}")
-    with warnings.catch_warnings():
-        warnings.filterwarnings("ignore", category=UserWarning, module="openmdao")
-        warnings.filterwarnings("ignore", category=DeprecationWarning, module="openmdao")
-        f = io.StringIO()
-        with contextlib.redirect_stdout(f):
-            try:
-                problem_name = f'case_{casenum}'
-                p = om.Problem(name=problem_name)
+# ---------- build DataFrame (and optionally also call save_db for persistence) ----------
+rows = []
+for i, r in enumerate(results):
+    row = {"case_id": i}
+    params_tuple = r["input_params"]
+    for j, spec in enumerate(input_params):
+        row[spec.name] = params_tuple[j+1]
+    row["range"] = r["range"]
+    row["success"] = int(r.get("success", r.get("status", 0)))
+    rows.append(row)
 
-                scenario = dymos_generator(problem=p, input_deck=input_deck)
-                for i, spec in enumerate(input_params):
-                    value = case[i + 1]
-                    set_nested_value(scenario.p.model_options["vehicle_0"], spec.deck_path, value)
+df = pd.DataFrame(rows)
 
-                scenario.setup()
-
-                dm.run_problem(
-                    scenario.p,
-                    run_driver=False,
-                    simulate=True,
-                )
-                range = p.get_val("traj_vehicle_0.terminal.timeseries.x", units="NM")[-1, 0]
-                result = {
-                    'input_params': case,
-                    'range': range,
-                    'status': 1,
-                    'comments': "SUCCESS"
-                }
-            except Exception as e:
-                # Allow the error to occur and capture the exception message.
-                result = {
-                    'input_params': case,
-                    'range': 0,
-                    'status': 0,
-                    'comments': f"Error: {e}"
-                }
-    return result
-    
-    input_params = [
-        NumericSpec(
-            name='boost_alpha_0',
-            bounds=(-30, 30),
-            deck_path=["trajectory_phases", "boost_11", "initial_conditions", "controls", "alpha", 0]
-        ),
-        NumericSpec(
-            name='boost_alpha_1',
-            bounds=(-30, 30),
-            deck_path=["trajectory_phases", "boost_11", "initial_conditions", "controls", "alpha", 1]
-        ),
-        CategoricalSpec(
-            name='motor_1_pulse_1_propellant',
-            types=["TP-H-3402A"],
-            deck_path=["motor_options", "motor_1_pulse_1_propellant"]
-        )
-    ]
+# If you want both DB and df, modify save_db to return df or just call it separately:
+# save_db(input_params, results)  # persist to SQLite if you want
 
 
+# ---------- phase 2: fit surrogate(s) on LHS results ----------
+Xcols = [s.name for s in numeric_specs]
+X       = df[Xcols].to_numpy(float)
+y_range = df["range"].to_numpy(float)
+y_succ  = df["success"].to_numpy(int)
 
-    numeric_specs = [spec for spec in input_params if isinstance(spec, NumericSpec)]
-    categorical_specs = [spec for spec in input_params if isinstance(spec, CategoricalSpec)]
-    pbounds = {spec.name: spec.bounds for spec in numeric_specs}
+ker_r = ConstantKernel(1.0) * Matern(length_scale=np.ones(len(Xcols)), nu=2.5) + WhiteKernel(1e-6)
+reg = Pipeline([
+    ("sc", StandardScaler()),
+    ("gp", GaussianProcessRegressor(kernel=ker_r, normalize_y=True, n_restarts_optimizer=3, random_state=0)),
+])
 
-    domain = [{'name': spec.name, 'type': 'continuous', 'domain': spec.bounds} for spec in numeric_specs]   
-    obj_function = objective_wrapper_factory(input_params, input_deck)
+ker_c = 1.0 * Matern(length_scale=np.ones(len(Xcols)), nu=1.5)
+clf = Pipeline([
+    ("sc", StandardScaler()),
+    ("gp", GaussianProcessClassifier(kernel=ker_c, random_state=0, max_iter_predict=200)),
+])
 
-
-    full_input_samples = GridSampling(input_params, n_samples=10)
-    print(full_input_samples)
-
-    with multiprocessing.Pool(processes=num_processors) as pool:
-        print("Created pool...")
-        task_partial = partial(run_traj_test, input_deck=input_deck, input_params=input_params)
-        results = pool.map(task_partial, full_input_samples)
-
-    for i, result in enumerate(results):
-        print(f"Case {i}:")
-        params_tuple = result['input_params']
-        for j, spec in enumerate(input_params):
-            print(f"  {spec.name}: {params_tuple[j+1]}")
-        print(f"  Range: {result['range']}")
-        print(f"  Status: {result['comments']}")
-        print("-" * 40)
-    
-    df = save_db(input_params, results)
-    Xcols = [spec.name for spec in numeric_specs]
-
-    # Now extract features and outcomes dynamically.
-    X = df[Xcols].to_numpy(float)
-    y_range = df["range"].to_numpy(float)  
-    # Assuming the database column "status" was used to store the binary success indicator.
-    y_succ = df["status"].astype(int).to_numpy()
-
-    # ---- Build surrogate models based on the dynamic parameters.
-    # Set up the Gaussian process regressor using only successful runs.
-    ker_r = ConstantKernel(1.0) * Matern(length_scale=np.ones(len(Xcols)), nu=2.5) + WhiteKernel(1e-6)
-    reg = Pipeline([
-        ("sc", StandardScaler()),
-        ("gp", GaussianProcessRegressor(kernel=ker_r, normalize_y=True,
-                                        n_restarts_optimizer=3, random_state=0))
-    ])
-    # Build a classifier using all runs.
-    ker_c = 1.0 * Matern(length_scale=np.ones(len(Xcols)), nu=1.5)
-    clf = Pipeline([
-        ("sc", StandardScaler()),
-        ("gp", GaussianProcessClassifier(kernel=ker_c, random_state=0, max_iter_predict=200))
-    ])
-
-    # Fit the regressor on only the successful runs.
-    mask_ok = y_succ == 1
+mask_ok = (y_succ == 1)
+if mask_ok.any():
     reg.fit(X[mask_ok], y_range[mask_ok])
-    clf.fit(X, y_succ)
+    best_y = float(y_range[mask_ok].max())
+else:
+    # fallback to avoid crash
+    reg.fit(X, y_range)
+    best_y = float(y_range.max())
 
-    # ---- Define Expected Improvement (EI) for a maximization problem.
-    best_y = y_range[mask_ok].max() if mask_ok.any() else 0.0
+clf.fit(X, y_succ)
 
-    def ei(mu, sigma, best, xi=0.01):
-        # Avoid division by zero.
-        sigma = np.maximum(sigma, 1e-12)
-        z = (mu - best - xi) / sigma
-        return (mu - best - xi) * norm.cdf(z) + sigma * norm.pdf(z)
-    # ---- Score candidate points by combining EI with the probability of success.
-    def score_candidates(C):
-        mu, std = reg.predict(C, return_std=True)
-        ei_val = ei(mu, std, best=best_y)
-        p_ok = clf.predict_proba(C)[:, 1]
-        return ei_val * p_ok, mu, p_ok
+from scipy.stats import norm
 
-    # ---- Propose new candidate points by searching the domain.
-    def suggest(n_suggestions=5, n_samples=20000, bounds=None):
-        if bounds is None:
-            # Generate bounds from the numeric_specs (assumes all have the same structure).
-            bounds = [spec.bounds for spec in numeric_specs]
-        lows  = np.array([b[0] for b in bounds])
-        highs = np.array([b[1] for b in bounds])
-        # Sample uniformly.
-        C = np.random.rand(n_samples, len(bounds)) * (highs - lows) + lows
-        scores, mu, p = score_candidates(C)
-        idx = np.argsort(-scores)[:n_suggestions]
-        return C[idx], scores[idx], mu[idx], p[idx]
+def ei(mu, sigma, best, xi=0.01):
+    sigma = np.maximum(sigma, 1e-12)
+    z = (mu - best - xi) / sigma
+    return (mu - best - xi) * norm.cdf(z) + sigma * norm.pdf(z)
 
-    cand, s, mu_vals, p_vals = suggest(n_suggestions=10)
-    df_candidates = pd.DataFrame(cand, columns=Xcols)
-    df_candidates = df_candidates.assign(score=s, pred_range=mu_vals, p_success=p_vals)
-    print(df_candidates)
-    exit()
+def score_candidates(C):
+    mu, std = reg.predict(C, return_std=True)
+    ei_val = ei(mu, std, best=best_y)
+    p_ok   = clf.predict_proba(C)[:, 1]
+    return ei_val * p_ok, mu, p_ok
+
+def suggest(n_suggestions=5, n_samples=20000, bounds=None, seed=0):
+    rng = np.random.default_rng(seed)
+    if bounds is None:
+        bounds = [s.bounds for s in numeric_specs]
+    lows  = np.array([b[0] for b in bounds], float)
+    highs = np.array([b[1] for b in bounds], float)
+    C = rng.random((n_samples, len(bounds))) * (highs - lows) + lows
+    scores, mu, p = score_candidates(C)
+    idx = np.argsort(-scores)[:n_suggestions]
+    return C[idx], scores[idx], mu[idx], p[idx]
+
+cand, s, mu_vals, p_vals = suggest(n_suggestions=10)
+df_candidates = pd.DataFrame(cand, columns=Xcols).assign(score=s, pred_range=mu_vals, p_success=p_vals)
+print(df_candidates.sort_values("score", ascending=False))
