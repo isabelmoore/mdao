@@ -1,3 +1,47 @@
+# phase 1: finding feasibility region (wrapper)
+def run_traj_test(case, input_deck, input_params):
+    # Retrieve case number.
+    casenum = case[0]
+    print(f"Running Trajectory Tests for case: {casenum}")
+    print(f"Processing case data: {case}")
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=UserWarning, module="openmdao")
+        warnings.filterwarnings("ignore", category=DeprecationWarning, module="openmdao")
+        f = io.StringIO()
+        with contextlib.redirect_stdout(f):
+            try:
+                problem_name = f'case_{casenum}'
+                p = om.Problem(name=problem_name)
+
+                scenario = dymos_generator(problem=p, input_deck=input_deck)
+                for i, spec in enumerate(input_params):
+                    value = case[i + 1]
+                    set_nested_value(scenario.p.model_options["vehicle_0"], spec.deck_path, value)
+
+                scenario.setup()
+
+                dm.run_problem(
+                    scenario.p,
+                    run_driver=False,
+                    simulate=True,
+                )
+                range = p.get_val("traj_vehicle_0.terminal.timeseries.x", units="NM")[-1, 0]
+                result = {
+                    'input_params': case,
+                    'range': range,
+                    'status': 1,
+                    'comments': "SUCCESS"
+                }
+            except Exception as e:
+                # Allow the error to occur and capture the exception message.
+                result = {
+                    'input_params': case,
+                    'range': 0,
+                    'status': 0,
+                    'comments': f"Error: {e}"
+                }
+    return result
+    
     input_params = [
         NumericSpec(
             name='boost_alpha_0',
