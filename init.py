@@ -1,201 +1,226 @@
-def simulate_trajectory(case, input_deck, input_params, casenum):
-    """
-    Run the simulation for a given case and return a dictionary with the results.
-    'case' is a list where case[1:] corresponds to the values for input_params in order.
-    """
-    try:
-        with warnings.catch_warnings():
-            warnings.filterwarnings("ignore", category=UserWarning, module="openmdao")
-            warnings.filterwarnings("ignore", category=DeprecationWarning, module="openmdao")
-            buf = io.StringIO()
-            with contextlib.redirect_stdout(buf):
-                problem_name = f'case_{casenum}'
-                p = om.Problem(name=problem_name)
-                scenario = dymos_generator(problem=p, input_deck=input_deck)
-                # Set parameters based on the provided NumericSpec objects.
-                for i, spec in enumerate(input_params):
-                    # case[0] can be a dummy placeholder; values start at index 1.
-                    value = case[i + 1]
-                    set_nested_value(scenario.p.model_options["vehicle_0"], spec.deck_path, value)
-                scenario.setup()
-                dm.run_problem(
-                    scenario.p,
-                    run_driver=False,
-                    simulate=True,
-                )
-                # Use a different name instead of 'range' to avoid shadowing the built-in range.
-                final_range = p.get_val("traj_vehicle_0.terminal.timeseries.x", units="NM")[-1, 0]
-        result = {
-            'input_params': case,
-            'range': final_range,
-            'status': 1,
-            'comments': "SUCCESS"
-        }
-    except Exception as e:
-        result = {
-            'input_params': case,
-            'range': 0,
-            'status': 0,
-            'comments': f"Error: {e}"
-        }
-    return result
-def eval_candidate(candidate, input_params, input_deck, casenum):
-    """
-    Convert candidate dict to simulation 'case' and evaluate target metric.
-    This function is defined at module level so it can be pickled.
-    """
-    # Build the case list: index 0 is a dummy placeholder and then follow the candidate values
-    case = [None] + [candidate[spec.name] for spec in input_params]
-    sim_result = simulate_trajectory(case, input_deck, input_params, casenum)
-    return sim_result["range"]
-def bayesian_optimization_batch(input_deck, input_params, casenum,
-                                param_bounds, init_points=20, n_iter=3,
-                                batch_size=10, num_processors=24):
+def bayesian_optimization_batch(
+    input_deck,
+    input_params,
+    casenum,
+    param_bounds,
+    init_points=20,
+    n_iter=3,
+    batch_size=10,
+    num_processors=24,
+    plot_params=None,
+    grid_points=100,
+    gif_name='bayesian_optimization.gif',
+):
     """
     Run batched Bayesian optimization using your expensive simulation.
+
+    Parameters
+    ----------
+    input_deck, input_params, casenum : as in your environment
+    param_bounds : dict[str, tuple[float, float]]
+        E.g., {"boost_alpha_0": (-30, 30), "boost_alpha_1": (-30, 30), "boost_t_dur": (5, 30), "r_throat": (0.1, 4.0)}
+    init_points : int
+        Number of random initial evaluations.
+    n_iter : int
+        Number of batch iterations.
+    batch_size : int
+        Candidates per iteration (evaluated in parallel).
+    num_processors : int
+        Parallel processes for simulation.
+    plot_params : tuple[str, str] | None
+        Two parameter names to project/plot. If None, uses the first two keys.
+    grid_points : int
+        Resolution of the 2D plotting grid.
+    gif_name : str
+        Output GIF filename.
+
+    Returns
+    -------
+    optimizer : BayesianOptimization
+        The fitted optimizer with registered observations.
     """
-    # Create a Bayesian optimizer with a dummy objective (since we register results manually).
+
+    # === Set up optimizer with a dummy objective (we register targets manually) ===
     optimizer = BayesianOptimization(
-        f=lambda **params: 0,
+        f=lambda **params: 0.0,
         pbounds=param_bounds,
         random_state=42,
     )
-    # Create a utility function; here we use UCB.
-    acq  = UtilityFunction(kind="ucb", kappa=2.5, xi=0.0)
 
+    # Acquisition function (UCB is fine; adjust kappa/xi to taste)
+    acq = UtilityFunction(kind="ucb", kappa=2.5, xi=0.0)
 
-    # Build a list of parameter keys.
+    # Parameter bookkeeping
     keys = list(param_bounds.keys())
-    lows = np.array([param_bounds[key][0] for key in keys])
-    highs = np.array([param_bounds[key][1] for key in keys])
-    
-    # Generate the initial random candidates.
-    random_points = np.random.uniform(lows, highs, size=(init_points, len(keys)))
-    initial_candidates = [{key: point[i] for i, key in enumerate(keys)} for point in random_points]
+    if len(keys) == 0:
+        raise ValueError("param_bounds is empty.")
 
-    # Create a partial function that already has input_params, input_deck, and casenum bound.
-    eval_func = partial(eval_candidate, input_params=input_params,
-                        input_deck=input_deck, casenum=casenum)
-    
-    # Make sure you pass eval_func (not eval_candidate) to pool.imap.
-    with multiprocessing.Pool(processes=num_processors) as pool:
-        initial_results = list(tqdm(pool.imap(eval_func, initial_candidates),
-                                    total=len(initial_candidates),
-                                    desc="Initial evaluations"))
-    
-    # Register these observations with the Bayesian optimizer.
+    # Figure out which two params to plot (if any)
+    if plot_params is not None:
+        if len(plot_params) != 2:
+            raise ValueError("plot_params must be a tuple of exactly two parameter names.")
+        p1, p2 = plot_params
+        if p1 not in keys or p2 not in keys:
+            raise ValueError("plot_params must be keys in param_bounds.")
+    else:
+        # default to first two if available
+        if len(keys) >= 2:
+            p1, p2 = keys[0], keys[1]
+        else:
+            p1, p2 = None, None  # Not enough params to do 2D plots
+
+    lows = np.array([param_bounds[k][0] for k in keys], dtype=float)
+    highs = np.array([param_bounds[k][1] for k in keys], dtype=float)
+
+    # === Initial random candidates ===
+    rng = np.random.default_rng(42)
+    random_points = rng.uniform(lows, highs, size=(init_points, len(keys)))
+    initial_candidates = [{k: float(pt[i]) for i, k in enumerate(keys)} for pt in random_points]
+
+    # === Parallel evaluation (initial) ===
+    eval_func = partial(eval_candidate, input_params=input_params, input_deck=input_deck, casenum=casenum)
+    with mp.Pool(processes=num_processors) as pool:
+        initial_results = list(
+            tqdm(pool.imap(eval_func, initial_candidates),
+                 total=len(initial_candidates),
+                 desc="Initial evaluations")
+        )
+
+    # Register initial observations
     for cand, result in zip(initial_candidates, initial_results):
-        optimizer.register(params=cand, target=result)
+        optimizer.register(params=cand, target=float(result))
         print(f"Input: {cand}, Output (Target): {result}")
-    # orig_bounds = param_bounds.copy()
 
-    # Track the Gaussian Process for updates
-    # Extract parameters and corresponding targets in the correct shape
-    X_train = np.array([list(cand.values()) for cand in initial_candidates])
-    y_train = np.array(initial_results)
+    # Build training arrays for our GP visualization model
+    X_train = np.array([list(c.values()) for c in initial_candidates], dtype=float)
+    y_train = np.array(initial_results, dtype=float)
 
-    gp = GaussianProcessRegressor(kernel=RBF(length_scale=1.0))  # Initialize the GP model
-    gp.fit(X_train, y_train)  # Fit the model with correct shapes
+    # GP for visualization (independent of optimizer's internal GP)
+    gp = GaussianProcessRegressor(kernel=RBF(length_scale=1.0), normalize_y=True)
+    if len(X_train) > 0:
+        gp.fit(X_train, y_train)
 
+    # For GIF frames
+    frames = []
 
-    # Iteratively evaluate batches of candidate points.
+    # === Batched iterations ===
     for it in range(n_iter):
-        batch_candidates = []
-        for _ in range(batch_size):
-            candidate = optimizer.suggest(acq)
-            batch_candidates.append(candidate)
+        # Suggest a batch of candidates
+        batch_candidates = [optimizer.suggest(acq) for _ in range(batch_size)]
 
-        # Evaluate the batch in parallel
-        with multiprocessing.Pool(processes=batch_size) as pool:
-            batch_results = list(tqdm(pool.imap(eval_func, batch_candidates),
-                                    total=len(batch_candidates),
-                                    desc=f"Batch iteration {it + 1}"))
+        # Evaluate the batch in parallel (use num_processors)
+        with mp.Pool(processes=num_processors) as pool:
+            batch_results = list(
+                tqdm(pool.imap(eval_func, batch_candidates),
+                     total=len(batch_candidates),
+                     desc=f"Batch iteration {it + 1}")
+            )
 
-        # Count how many results are zero.
-        zero_count = sum(1 for result in batch_results if result == 0)
+        # Diagnostics
+        zero_count = sum(1 for r in batch_results if r == 0)
         print(f"Iteration {it + 1} complete. {zero_count} out of {len(batch_results)} evaluated to zero.")
-        
-        # Register the results with the optimizer
-        for cand, result in zip(batch_candidates, batch_results):
-            optimizer.register(params=cand, target=result)
 
-            # Print the inputs (parameters) and outputs (results)
+        # Register observations
+        for cand, result in zip(batch_candidates, batch_results):
+            optimizer.register(params=cand, target=float(result))
             print(f"Input: {cand}, Output (Target): {result}")
 
-        # Update the Gaussian Process model with the new results
-        X_train = np.vstack((X_train, np.array([list(cand.values()) for cand in batch_candidates])))
-        y_train = np.concatenate((y_train, batch_results))  # Concatenate results
-        gp.fit(X_train, y_train)  # Refit the GP model with updated data
+        # Update GP train set and refit visualization GP
+        if len(batch_candidates) > 0:
+            X_batch = np.array([list(c.values()) for c in batch_candidates], dtype=float)
+            y_batch = np.array(batch_results, dtype=float)
+            X_train = np.vstack((X_train, X_batch))
+            y_train = np.concatenate((y_train, y_batch))
+            gp = GaussianProcessRegressor(kernel=RBF(length_scale=1.0), normalize_y=True)
+            gp.fit(X_train, y_train)
 
-        # Calculate y_max from the maximum observed target value
-        y_max = optimizer.max['target'] if optimizer.max is not None else max(batch_results) if batch_results else 0
+        # Best-so-far target
+        if optimizer.max is not None and 'target' in optimizer.max:
+            y_max = float(optimizer.max['target'])
+        else:
+            y_max = float(np.max(y_train)) if y_train.size > 0 else 0.0
         print("y_max:", y_max)
 
-        # Create the plot for the current iteration
-        fig, axs = plt.subplots(1, 3, figsize=(15, 5))
-        X1, X2 = np.meshgrid(np.linspace(-6, 6, 100), np.linspace(-6, 6, 100))
+        # ----------------------------------------------------------------------------------
+        # Visualization (2D projection over p1, p2). If fewer than 2 params, skip plotting.
+        # ----------------------------------------------------------------------------------
+        if p1 is not None and p2 is not None:
+            # Fix remaining params at current best (fallback to midpoint if no best yet)
+            if optimizer.max is not None and 'params' in optimizer.max:
+                fixed = {k: float(optimizer.max['params'][k]) for k in keys if k not in (p1, p2)}
+            else:
+                fixed = {k: float((param_bounds[k][0] + param_bounds[k][1]) / 2.0)
+                         for k in keys if k not in (p1, p2)}
 
-        # Generate predictions and the acquisition function
-        Z_gp_mean, _ = gp.predict(X_train, return_std=True)
-        Z_acquisition = acq.utility(gp, y_max)  # Utilize gp and y_max correctly
+            # 2D mesh over p1, p2
+            p1_lin = np.linspace(param_bounds[p1][0], param_bounds[p1][1], grid_points)
+            p2_lin = np.linspace(param_bounds[p2][0], param_bounds[p2][1], grid_points)
+            X1, X2 = np.meshgrid(p1_lin, p2_lin)
 
-        # Create contour plots
-        axs[0].contourf(X1, X2, Z_gp_mean.reshape(X1.shape), levels=100, cmap='viridis')
-        axs[0].set_title('Gaussian Process Predicted Mean')
+            # Build full-dim X_query for the grid
+            X_query = []
+            for a, b in zip(X1.ravel(), X2.ravel()):
+                row = []
+                for k in keys:
+                    if k == p1:
+                        row.append(a)
+                    elif k == p2:
+                        row.append(b)
+                    else:
+                        row.append(fixed[k])
+                X_query.append(row)
+            X_query = np.array(X_query, dtype=float)  # (grid_points^2, D)
 
-        axs[1].contourf(X1, X2, np.random.rand(*X1.shape), levels=100, cmap='viridis')
-        axs[1].set_title('Random Landscape (Simulated)')
+            # GP predictions + acquisition on the grid
+            if X_train.size > 0:
+                Z_mu, Z_std = gp.predict(X_query, return_std=True)
+                Z_acq = acq.utility(X_query, gp, y_max)  # <-- correct signature
+            else:
+                # If somehow we have nothing trained, show blanks
+                Z_mu = np.zeros(X_query.shape[0], dtype=float)
+                Z_std = np.zeros(X_query.shape[0], dtype=float)
+                Z_acq = np.zeros(X_query.shape[0], dtype=float)
 
-        axs[2].contourf(X1, X2, Z_acquisition.reshape(X1.shape), levels=100, cmap='viridis')
-        axs[2].set_title('Acquisition Function')
+            # Plot: mean, std, acquisition
+            fig, axs = plt.subplots(1, 3, figsize=(18, 5))
 
-        plt.tight_layout()
-        frame_filename = f"frame_{it}.png"
-        plt.savefig(frame_filename)
-        plt.close(fig)
+            im0 = axs[0].contourf(X1, X2, Z_mu.reshape(X1.shape), levels=50)
+            axs[0].set_title('GP Predicted Mean')
+            axs[0].set_xlabel(p1); axs[0].set_ylabel(p2)
+            fig.colorbar(im0, ax=axs[0])
 
-        # Create GIF from frames
-    with imageio.get_writer('bayesian_optimization.gif', mode='I', duration=1) as writer:
+            im1 = axs[1].contourf(X1, X2, Z_std.reshape(X1.shape), levels=50)
+            axs[1].set_title('GP Predictive Std')
+            axs[1].set_xlabel(p1); axs[1].set_ylabel(p2)
+            fig.colorbar(im1, ax=axs[1])
+
+            im2 = axs[2].contourf(X1, X2, Z_acq.reshape(X1.shape), levels=50)
+            axs[2].set_title(f'Acquisition ({acq.kind.upper()})')
+            axs[2].set_xlabel(p1); axs[2].set_ylabel(p2)
+            fig.colorbar(im2, ax=axs[2])
+
+            plt.tight_layout()
+            frame_filename = f"frame_{it:03d}.png"
+            plt.savefig(frame_filename, dpi=120)
+            plt.close(fig)
+            frames.append(frame_filename)
+
+    # ----------------------------------------------------------------------------------
+    # Build GIF from frames (if any)
+    # ----------------------------------------------------------------------------------
+    if frames:
+        with imageio.get_writer(gif_name, mode='I', duration=1.0) as writer:
+            for frame in frames:
+                writer.append_data(imageio.imread(frame))
+
+        # Clean up frame files
         for frame in frames:
-            image = imageio.imread(frame)
-            writer.append_data(image)
+            try:
+                os.remove(frame)
+            except OSError:
+                pass
 
-    # Optionally: Clean up temporary frame files
-    for frame in frames:
-        os.remove(frame)
+        print(f"GIF created: {gif_name}")
 
-    print("GIF created: bayesian_optimization.gif")
-    
     print("Optimization finished.")
     return optimizer
-
-
-
-
-(py311) [imoore@sequoia init_cond_opt]$ python train_init_perturbation.py
-Number of CPU cores: 32
-Number of available CPUs: 32
-Optimal number of processors: 16
-Initial evaluations: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 6/6 [00:57<00:00,  9.58s/it]
-Input: {'boost_alpha_0': 28.695925891169175, 'boost_alpha_1': -9.556887081250682, 'boost_t_dur': 11.80999262535104, 'r_throat': 1.445287691093599}, Output (Target): 0
-Input: {'boost_alpha_0': -3.4892858710217958, 'boost_alpha_1': -7.195443491698793, 'boost_t_dur': 9.419355508289609, 'r_throat': 3.4049632842784656}, Output (Target): 0
-Input: {'boost_alpha_0': -28.763460283957766, 'boost_alpha_1': -1.1035959196202292, 'boost_t_dur': 26.641716730734153, 'r_throat': 2.9667750733155733}, Output (Target): 0
-Input: {'boost_alpha_0': -11.042055776890574, 'boost_alpha_1': -0.1718530638254947, 'boost_t_dur': 22.49357472726761, 'r_throat': 1.1265597986061453}, Output (Target): 0
-Input: {'boost_alpha_0': -8.581387395810406, 'boost_alpha_1': 21.759193615370037, 'boost_t_dur': 24.420395844557696, 'r_throat': 3.5660126158198215}, Output (Target): 0
-Input: {'boost_alpha_0': -17.319699070375258, 'boost_alpha_1': 11.887322252673634, 'boost_t_dur': 16.327332078124485, 'r_throat': 0.28380333182442574}, Output (Target): 72.53444396918908
-Batch iteration 1: 100%|████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 2/2 [00:53<00:00, 26.77s/it]
-Iteration 1 complete. 1 out of 2 evaluated to zero.
-Input: {'boost_alpha_0': -17.531767529880867, 'boost_alpha_1': 11.748033692651894, 'boost_t_dur': 16.811666693112283, 'r_throat': 0.1865250675090119}, Output (Target): 83.6805900691833
-Input: {'boost_alpha_0': -27.046883120394863, 'boost_alpha_1': -28.891007999206412, 'boost_t_dur': 18.414666265866213, 'r_throat': 3.646752041252828}, Output (Target): 0
-y_max: 83.6805900691833
-Traceback (most recent call last):
-  File "/home/imoore/misslemdao/tools/traj_ann/init_cond_opt/train_init_perturbation.py", line 758, in <module>
-    main(16)
-  File "/home/imoore/misslemdao/tools/traj_ann/init_cond_opt/train_init_perturbation.py", line 684, in main
-    optimizer = bayesian_optimization_batch(input_deck, input_params, casenum,
-                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/imoore/misslemdao/tools/traj_ann/init_cond_opt/train_init_perturbation.py", line 587, in bayesian_optimization_batch
-    Z_acquisition = acq.utility(gp, y_max)  # Utilize gp and y_max correctly
-                    ^^^^^^^^^^^^^^^^^^^^^^
-TypeError: UtilityFunction.utility() missing 1 required positional argument: 'y_max'
-(py311) [imoore@sequoia init_cond_opt]$ 
