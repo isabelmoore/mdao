@@ -1,119 +1,87 @@
+# --- knobs (kept local so you can tweak quickly) ---
+RANGE_KEY = "range"   # or "range_nm" if you renamed it
+TOP_K     = 10
 
-    separator = "-" * 80
-    for res in results[:10]:
-        print(separator)
-        for key, value in res.items():
-            print(f"{key:30}: {value}")
-            
-    # --- Filter + sort successful results ---
-    zero_count = sum(1 for res in results if res.get('status') == 0.0)
-    print(f"\nLoading complete. {zero_count} / {len(results)} simulations failed (evaluated to 0 NM range)")
+# --- compact peek at first 10 results ---
+print("\nSample results (first 10):")
+for i, res in enumerate(results[:10], 1):
+    print("-" * 80)
+    for k in sorted(res.keys()):
+        v = res[k]
+        print(f"{k:30}: {v}")
 
-    successful_results = [res for res in results if res.get('status') == 1]
-    sorted_successful = sorted(successful_results, key=lambda r: r.get('range', float('-inf')), reverse=True)
+# --- basic counters + success filter ---
+total = len(results)
+failed = sum(1 for r in results if int(r.get("status", 0)) == 0)
+print(f"\nLoading complete. {failed} / {total} simulations failed (status == 0)")
 
-    print("Top 10 Successful Cases by Range:")
+successful = [r for r in results if int(r.get("status", 0)) == 1 and r.get(RANGE_KEY) is not None]
+success_sorted = sorted(successful, key=lambda r: float(r.get(RANGE_KEY, float("-inf"))), reverse=True)
+
+# --- top-K table (stable column order: case_id, params…, range, status) ---
+print("\nTop Successful Cases by Range:")
+if success_sorted:
+    param_names = [spec.name for spec in input_params]  # include numeric + categorical if any
+    columns = ["case_id", *param_names, RANGE_KEY, "status"]
+
     table = PrettyTable()
+    table.field_names = columns
 
-    if sorted_successful:
-        sample_case = sorted_successful[0]
-        excluded_keys = {'status', 'case_id', 'comments'}
-        field_names = [k for k in sample_case.keys() if k not in excluded_keys]
-        table.field_names = field_names
+    for r in success_sorted[:TOP_K]:
+        row = []
+        for c in columns:
+            val = r.get(c)
+            row.append(f"{val:.4f}" if isinstance(val, float) else val)
+        table.add_row(row)
+    print(table)
+else:
+    print("No successful results found (status == 1). Skipping table and plots.")
 
-        for result in sorted_successful[:10]:
-            row = []
-            for key in field_names:
-                val = result.get(key)
-                if isinstance(val, float):
-                    row.append(f"{val:.4f}")
-                else:
-                    row.append(val)
-            table.add_row(row)
+# --- plotting (only if we have successes) ---
+if success_sorted:
+    # numeric params only for scatter vs RANGE_KEY
+    numeric_param_names = [spec.name for spec in input_params if isinstance(spec, NumericSpec)]
+    if numeric_param_names:
+        y_arr = np.asarray([float(r[RANGE_KEY]) for r in success_sorted], dtype=float)
 
-        print(table)
-    else:
-        print("No successful results found (status == 1). Skipping table and plots.")
-
-    try:
-        numeric_param_names = [spec.name for spec in input_params if isinstance(spec, NumericSpec)]
-    except NameError:
-        if sorted_successful:
-            candidate_keys = [k for k, v in sorted_successful[0].items() if k not in {'status', 'case_id', 'comments', 'range'}]
-            numeric_param_names = []
-            for k in candidate_keys:
-                vals = [r.get(k) for r in sorted_successful[:50]]
-                nums = [x for x in vals if isinstance(x, (int, float))]
-                if len(nums) >= max(3, int(0.6 * len(vals))):
-                    numeric_param_names.append(k)
-        else:
-            numeric_param_names = []
-
-    successful_cases = {name: [] for name in numeric_param_names}
-    for r in sorted_successful:
-        for name in numeric_param_names:
-            v = r.get(name)
-            if v is not None:
-                try:
-                    successful_cases[name].append(float(v))
-                except (TypeError, ValueError):
-                    pass
-
-    successful_cases = {k: v for k, v in successful_cases.items() if len(v) > 0}
-    if not successful_cases:
-        print("No numeric parameter data available to plot. Skipping plots.")
-    else:
-        n_params = len(successful_cases)
-
-        fig, axs = plt.subplots(n_params, 1, figsize=(10, 3 * n_params), sharex=False)
-        if n_params == 1:
+        n = len(numeric_param_names)
+        fig, axs = plt.subplots(n, 1, figsize=(10, 3 * n), sharex=False)
+        if n == 1:
             axs = [axs]
 
-        # Loop over each parameter 
-        for ax, (name, xvals) in zip(axs, successful_cases.items()):
-            yvals = []
-            x_aligned = []
-            for x, r in zip(xvals, sorted_successful):
-                try:
-                    y = float(r['range'])
-                    x_aligned.append(float(x))
-                    yvals.append(y)
-                except (KeyError, TypeError, ValueError):
-                    continue
-            if len(x_aligned) == 0:
-                print(f"No aligned data to plot for parameter '{name}'.")
-                continue
-            x_arr = np.array(x_aligned, dtype=float)
-            y_arr = np.array(yvals, dtype=float)
-            
-            sc = ax.scatter(x_arr, y_arr, marker='o', c=y_arr, cmap='viridis_r', label='Successful Cases')
-            
-            ax.set_title(f"Parameter {name}")
-            ax.set_ylabel("Target Value (Range)")
-            xmin, xmax = float(np.min(x_arr)), float(np.max(x_arr))
-            ymin, ymax = float(np.min(y_arr)), float(np.max(y_arr))
-            if xmax > xmin:
-                ax.set_xlim(xmin - 0.1 * (xmax - xmin), xmax + 0.1 * (xmax - xmin))
-            if ymax > ymin:
-                ax.set_ylim(ymin - 0.1 * (ymax - ymin), ymax + 0.1 * (ymax - ymin))
-            ax.grid(True)
-            
-            cbar = plt.colorbar(sc, ax=ax)
-            cbar.set_label("Target Value (Range)")
-            idx_max = np.argmax(y_arr)
-            max_val = y_arr[idx_max]
-            max_x = x_arr[idx_max]
-            
-            ax.annotate(f"max: {max_x:.2f}, range: {max_val:.2f}",
-                        xy=(max_x, max_val), 
-                        xytext=(max_x, max_val + 0.05*(ymax-ymin)),
-                        arrowprops=dict(facecolor='black', arrowstyle='->'),
-                        fontsize=9,
-                        color='red')
+        for ax, pname in zip(axs, numeric_param_names):
+            x_arr = np.asarray([float(r[pname]) for r in success_sorted], dtype=float)
 
-        axs[-1].set_xlabel("Parameter Value")
-        fig.suptitle("Cases for Each Parameter", fontsize=16)
-        
-        plt.tight_layout(rect=[0, 0, 1, 1])        
+            sc = ax.scatter(x_arr, y_arr, c=y_arr, cmap="viridis_r", s=18)
+            ax.set_title(f"{pname} vs {RANGE_KEY}")
+            ax.set_xlabel(pname)
+            ax.set_ylabel(RANGE_KEY)
+            ax.grid(True, alpha=0.3)
+
+            cbar = plt.colorbar(sc, ax=ax)
+            cbar.set_label(RANGE_KEY)
+
+            # annotate max
+            idx = int(np.argmax(y_arr))
+            ax.annotate(
+                f"max: {x_arr[idx]:.2f}, {y_arr[idx]:.2f}",
+                xy=(x_arr[idx], y_arr[idx]),
+                xytext=(x_arr[idx], y_arr[idx] * 1.01),
+                arrowprops=dict(arrowstyle="->"),
+            )
+
+            # gentle padding if ranges are non-degenerate
+            if np.ptp(x_arr) > 0:
+                xr = np.ptp(x_arr)
+                ax.set_xlim(x_arr.min() - 0.1 * xr, x_arr.max() + 0.1 * xr)
+            if np.ptp(y_arr) > 0:
+                yr = np.ptp(y_arr)
+                ax.set_ylim(y_arr.min() - 0.1 * yr, y_arr.max() + 0.1 * yr)
+
+        fig.suptitle("Successful Cases per Parameter", fontsize=14)
+        plt.tight_layout(rect=[0, 0, 1, 0.98])
         plt.savefig(report_dir / "success_parameters.png", dpi=200)
-        print("Saved scatter grid to parameters.png")
+        plt.close(fig)
+        print("Saved scatter grid to success_parameters.png")
+    else:
+        print("No numeric parameter data available to plot. Skipping plots.")
