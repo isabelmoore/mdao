@@ -1,191 +1,221 @@
+def train_model(X_train, X_test, y_train, y_test, model, model_type, num_epochs, batch_size, patience, l1_lambda, learning_rate, window_size, device):
+    model.to(device)
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+    starttime = time.time()
+    train_losses, test_losses = [], []
+    best_test_loss = float('inf')  
+    patience_counter = 0
+    dataset = TensorDataset(X_train, y_train)
+    data_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    seq_length = y_train.size(2)  
+  
+    for epoch in range(num_epochs):
+        train_loss = 0
+        # model.train()
+        for batch_X, batch_y in data_loader:
+            batch_X, batch_y = batch_X.to(device), batch_y.to(device)
 
-class FlexibleNeuralNet(nn.Module):
-    def __init__(self, num_layers, activation_type="tanh", dropout=0.5):
-        super(FlexibleNeuralNet, self).__init__()
-        self.layers = nn.ModuleList()
+            if model_type == 'flex' or model_type == 'lstm_onetomany':
+                loss = model.train(batch_X, batch_y)
+
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                    
+            elif model_type == 'lstm_manytoone':
+                loss = model.train(batch_X, batch_y)
+
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+            elif model_type == 'transformer':
+                loss = model.train(batch_X, batch_y, model)
+                
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+            train_loss += loss.item()  
+        train_loss /= len(data_loader)
+        train_losses.append(train_loss)
+        
+        # Evaluate on test set
+        model.eval()
+        dataset = TensorDataset(X_test, y_test)
+        test_loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+        with torch.no_grad():
+            test_loss = 0
+            window_y = torch.zeros(batch_size, batch_y.size(2), window_size).to(device) 
+
+            for batch_X, batch_y in test_loader:
+                if model_type == 'flex' or model_type == 'lstm_onetomany':
+                    loss = model.train(batch_X, batch_y)
+
+                elif model_type == 'lstm_manytoone':
+                    loss = model.train(batch_X, batch_y)
+
+                elif model_type == 'transformer':
+                    loss = model.train(batch_X, batch_y)
+
+                test_loss += loss.item()  
+            test_loss /= len(test_loader)
+            test_losses.append(test_loss)            
+        
+        if test_loss < best_test_loss:
+            best_test_loss = test_loss
+            patience_counter = 0
+        else:
+            patience_counter += 1
+        
+        if patience_counter >= patience:
+            print(f"Early stopping triggered at epoch {epoch + 1}")
+            break
+
+        if (epoch + 1) % 100 == 0:
+            elapsed_time = time.time() - starttime
+            print(f"Epoch {epoch + 1}/{num_epochs}: Train loss: {train_loss:.5E}, Test loss: {test_loss:.5E}, Time elapsed: {elapsed_time:.2f} sec")
+
+    return model, train_losses, test_losses
+
+if __name__ == "__main__":
+    start_time = time.time()
+
+    ###### Set Argument Parser ######
+    # parser = argparse.ArgumentParser()
+    # parser.add_argument("-e", "--epochs", required=True, type=int, help="number of epochs")
+    
+    # args = parser.parse_args()
+    # num_epochs = args.epochs
+
+    ###### Set Parameters ######
+    model_type = 'transformer'
+    # flex,  lstm_onetomany, lstm_manytoone, transformer
+
+    rerun_training = True
+    save_new_model = True
+ 
+    recreate_dataset = True # reshuffle?
+    save_new_dataset = True
+
+    batch_size = 64
+    hidden_size = 32  
+    num_layers = 3
+    patience = 500
+    l1_lambda = 0.0001
+    learning_rate = 0.001
+    num_epochs = 10000
+    dropout = 0.5
+    window_size=10
+
+
+    criterion = nn.MSELoss()
+    # Load generated dataset
+    db_filename = '/home/imoore/misslemdao/trajectory_results_azimuth21_range51_cores30_date_2025_06_25_time_2035.db'
+
+    if recreate_dataset:
+        X_train, X_test, y_train, y_test, scaler_x, scaler_y = prepare_data(db_filename, save_new_dataset)
+    else:
+        with open('data.pkl', 'rb') as f:
+            X_train, X_test, y_train, y_test, scaler_x, scaler_y = pickle.load(f)
+
+    device = torch.device(f"cuda:{LOCAL_RANK}" if torch.cuda.is_available() else "cpu")
+
+    torch.cuda.set_device(device)
+    X_train = torch.tensor(X_train, dtype=torch.float32).to(device)
+    y_train = torch.tensor(y_train, dtype=torch.float32).to(device)
+    X_test = torch.tensor(X_test, dtype=torch.float32).to(device)
+    y_test = torch.tensor(y_test, dtype=torch.float32).to(device)
+
+    if model_type == 'flex':
         input_size = 2  
         output_size = 212 
         output_shape = (2, 106)
+
+        activation_type = "ReLU"
+
         layer_sizes = [input_size] + [hidden_size] * num_layers + [output_size]  
-        for i in range(len(layer_sizes) - 1):
-            self.layers.append(nn.Linear(layer_sizes[i], layer_sizes[i + 1]))
-            if i != 0 and i < len(layer_sizes) - 2:
-                self.layers.append(nn.BatchNorm1d(layer_sizes[i + 1]))
-            if activation_type == "tanh":
-                self.layers.append(nn.Tanh())
-            elif activation_type == "ReLU":
-                self.layers.append(nn.LeakyReLU())
-            elif activation_type == "SiLU":
-                self.layers.append(nn.SiLU())
-            else:
-                pass
-            if i != 0 and i < len(layer_sizes) - 2:
-                self.layers.append(nn.Dropout(dropout))
-        self.model = model
-        self.device = device
-
-    def forward(self, x):
-        # Flatten the input for the fully connected layers
-        x = x.view(x.size(0), -1)
-        for layer in self.layers:
-            x = layer(x)
-        return x.view(x.size(0), 2, -1)  # Assure shape compatibility
-
-    def train(self, batch_X, batch_y):
-        batch_X = batch_X.unsqueeze(1)
-        predictions = self.model(batch_X)
-        loss = criterion(predictions, batch_y)
-        return loss
-    
-    def predict(self, azimuth, range_, scaler_x, scaler_y):
-        self.model.to(device)
-        self.model.eval() 
-        input_data = np.array([[azimuth, range_]], dtype=np.float32)
-        scaled_input = scaler_x.transform(input_data)
-        batch_X_test = torch.tensor(scaled_input, dtype=torch.float32).unsqueeze(1).to(self.device)
-         
-        predictions = self.model(batch_X_test)
-        predictions_cpu = predictions.cpu().numpy().reshape(-1, 106)
+        print(f"Layer Sizes: {layer_sizes}")
         
-        inverse_predictions = scaler_y.inverse_transform(predictions_cpu) 
-        return inverse_predictions[0], inverse_predictions[1]
+        model = FlexibleNeuralNet(layer_sizes=layer_sizes, activation_type=activation_type, dropout=dropout).to(device)
 
-class LSTMModel_OnetoMany(nn.Module):
-    def __init__(self, hidden_size, num_layers, dropout=0.5):
-        super(LSTMModel_OnetoMany, self).__init__()
-        self.hidden_size = hidden_size
-        self.num_layers = num_layers
-        self.input_dim = 2
-        self.output_dim = 2
-        self.output_length = 106        
-        self.lstm = nn.LSTM(input_dim, hidden_size, num_layers, batch_first=True, dropout=dropout if num_layers > 1 else 0)
+    if model_type == 'lstm_onetomany':
+        input_dim = 2
+        output_dim = 2
+        
+        model = LSTMModel_OnetoMany(input_dim, output_dim, hidden_size, num_layers, dropout).to(device)
 
-        self.final_output = nn.Conv1d(
-            in_channels=self.hidden_size,  
-            out_channels=self.output_dim * self.output_length,  
-            kernel_size=1  
+    if model_type == 'lstm_manytoone':
+        input_dim = 4
+        output_dim = 2
+        patience = 5
+        
+        model = LSTMModel_ManytoOne(input_dim, output_dim, hidden_size, num_layers, dropout, criterion).to(device)
+
+    if model_type == 'transformer':
+        model = TransformerCondDecoder(criterion=criterion).to(device)
+
+    print(model)
+    """
+    Grid Search for Hyperparameter Tuning
+    """
+    # X_train_numpy = X_train.cpu().numpy()
+    # y_train_numpy = y_train.cpu().numpy()
+    # print("X_train_numpy.shape:", X_train_numpy.shape)
+    # print("y_train_numpy.shape:", y_train_numpy.shape)
+
+    # param_grid = {
+    #     'hidden_size': [32, 64, 128],
+    #     'num_layers': [1, 2, 3, 4], 
+    #     # 'activation_type': ["tanh", "ReLU"],
+    #     'epochs': [10000],
+    #     'lr': [0, 0.01, 0.001, 0.0001], 
+    #     'batch_size': [32, 64, 128, 256],
+    #     'patience': [300],
+    #     'l1_lambda': [0, 0.0001, 0.001],
+    #     'dropout': [0.1, 0.25, 0.5]
+    # }
+
+    # model_grid_search = ModelWrapper(model_type="lstm_onetomany")
+    def custom_scorer(y_true, y_pred):
+        y_pred_reshaped = y_pred.reshape(y_true.shape)
+        return -np.mean((y_pred_reshaped - y_true) ** 2)
+
+    # scorer = make_scorer(custom_scorer, greater_is_better=True)
+
+    # with joblib.parallel_backend('threading'):
+    #     grid_search = GridSearchCV(
+    #         estimator=model_grid_search,   # model wrapper object
+    #         param_grid=param_grid,         # hyperparameter combinations
+    #         scoring=scorer,                # custom scoring function
+    #         n_jobs=2,                      # maximum parallel jobs
+    #         cv=3                           # cross-validation splits
+    #     )        
+    #     grid_search.fit(X_train_numpy, y_train_numpy)
+    # best_model = grid_search.best_estimator_
+    # print(f"Best Parameters: {grid_search.best_params_}")
+    # print(f"Best Score: {grid_search.best_score_}")
+
+    if rerun_training: 
+        model, train_losses, test_losses = train_model(
+            X_train, X_test, y_train, y_test, 
+            model,
+            model_type=model_type,
+            num_epochs=num_epochs, 
+            device=device,
+            batch_size=batch_size,
+            patience=patience,
+            l1_lambda=l1_lambda,
+            learning_rate=learning_rate,
+            window_size=window_size
         )
-        self.dropout = nn.Dropout(p=dropout)
-        self.model = model
-        self.device = device
+        torch.distributed.destroy_process_group()
 
-    def forward(self, x):
-        lstm_out, _ = self.lstm(x)  
-        lstm_out = lstm_out.permute(0, 2, 1)  
-        output = self.final_output(lstm_out) 
-        output = output.view(-1, self.output_dim, self.output_length)
-        return output
-    
-    def train(self, batch_X, batch_y):
-        batch_X = batch_X.unsqueeze(1)
-        predictions = self.model(batch_X)
-        loss = criterion(predictions, batch_y)
-        return loss
-    
-    def predict(self, azimuth, range_, scaler_x, scaler_y):
-        self.model.to(device)
-        self.model.eval() 
-        input_data = np.array([[azimuth, range_]], dtype=np.float32)
-        scaled_input = scaler_x.transform(input_data)
-        batch_X_test = torch.tensor(scaled_input, dtype=torch.float32).unsqueeze(1).to(self.device)
-         
-        predictions = self.model(batch_X_test)
-        predictions_cpu = predictions.cpu().numpy().reshape(-1, 106)
-        
-        inverse_predictions = scaler_y.inverse_transform(predictions_cpu) 
-        return inverse_predictions[0], inverse_predictions[1]
+    else:
+        torch.distributed.destroy_process_group()
+        # model.load_state_dict(torch.load('trajectory_nn_model_2.pth'))
 
-class LSTMModel_ManytoOne(nn.Module):
-    def __init__(self, hidden_size, num_layers, dropout=0.5):
-        super(LSTMModel_ManytoOne, self).__init__()
-        self.hidden_size = hidden_size
-        self.num_layers = num_layers
-        self.input_dim = 4
-        self.output_dim = 2
 
-        self.lstm = nn.LSTM( self.input_dim, hidden_size, num_layers, batch_first=True, dropout=dropout if num_layers > 1 else 0)
-        self.final_output = nn.Linear(hidden_size,  self.output_dim)
-        self.model = model
-        self.device = device
-
-    def forward(self, x):
-        lstm_out, _ = self.lstm(x)  
-        lstm_out = lstm_out[:, -1, :] 
-        output = self.final_output(lstm_out) 
-        return output 
-
-    def train(self, batch_X, batch_y):
-        predictions = []
-        targets = []
-
-        for start in range(0, seq_length + 1):
-            prediction, target = nnm.train_manytoone(start, window_size, seq_length, batch_X, batch_y)
-            
-            predictions.append(prediction)  
-            targets.append(target)  
-            
-        predictions = torch.cat(predictions, dim=1)  
-        targets = torch.cat(targets, dim=1)
-
-        loss = criterion(predictions, targets)
-        return loss
-
-    def predict(self, azimuth, range_, scaler_x, scaler_y):
-        self.model.to(device)
-        self.model.eval() 
-
-        input_data = np.array([[azimuth, range_]], dtype=np.float32)
-        scaled_input = scaler_x.transform(input_data)
-        batch_X_test = torch.tensor(scaled_input, dtype=torch.float32).unsqueeze(1).to(self.device)
-        
-        seq_length = 10
-        window_size = 10  
-        batch_size = 1   
-
-        if len(batch_X_test.shape) == 3:
-            batch_X_test = batch_X_test.squeeze(1)  
-        
-        print(f"batch_X_test: {batch_X_test.shape}")
-
-        predictions = []
-
-        for start in range(seq_length + 1):
-            end = start + window_size
-
-            if end > seq_length:
-                end = seq_length
-
-            if start == 0:
-                # Initialize window_y to zeros for the first iteration
-                window_y = torch.zeros(1, 2, window_size).to(self.device)
-            else:
-                # Ensure the shape of window_y for consistency
-                if window_y is None or window_y.shape != (1, 2, window_size):
-                    window_y = torch.zeros(1, 2, window_size).to(self.device)
-
-            window_X = batch_X_test.view(1, 2).unsqueeze(2).expand(-1, -1, window_size)  
-
-            window_input = torch.cat((window_X, window_y), dim=1)  # Shape: [1, 10, 4]
-            window_input = window_input.permute(0, 2, 1)  # Shape: [1, 4, 10] to [1, 10, 4]
-            # Model prediction
-            prediction = self.model(window_input)  # Shape: [1, 2]
-
-            # Update `window_y` for the next iteration
-            if start < seq_length:
-                window_y = torch.cat((window_y[:, :, 1:], prediction.unsqueeze(2)), dim=2)  # Keep size [64, 2, 10]
-            
-            prediction = prediction.unsqueeze(1)  # Shape: [1, 1, 2]
-            predictions.append(prediction)
-
-        predictions_tensor = torch.cat(predictions, dim=1)  # Shape: [1, seq_length + 1, 2]
-        print("predictions tensor:", predictions_tensor.shape)  # Should be [1, seq_length, 2]
-        print("scaler:", scaler_y.scale_.shape)  # Should match the number of features, 2 in this case
-        
-        predictions_tensor_reshaped = predictions_tensor.cpu().numpy().reshape(-1, 2)  # Shape: [N, 2]
-
-        # Now perform the inverse transform
-        inverse_predictions = scaler_y.inverse_transform(predictions_tensor_reshaped)
-        return inverse_predictions[:, 0], inverse_predictions[:, 1]
 
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model: int, max_len: int = 4096):
@@ -203,7 +233,8 @@ class PositionalEncoding(nn.Module):
 
 class TransformerCondDecoder(nn.Module):
     def __init__(self, seq_len=120, cond_dim=2, out_dim=2,
-                 d_model=128, nhead=8, num_layers=4, dropout=0.1):
+                 d_model=256, nhead=8, num_layers=6, dropout=0.1, 
+                 criterion=None):
         super(TransformerCondDecoder, self).__init__()
         self.seq_len = seq_len
         self.out_dim = out_dim
@@ -220,6 +251,7 @@ class TransformerCondDecoder(nn.Module):
         self.decoder = nn.TransformerDecoder(dec_layer, num_layers=num_layers)
         self.out_head = nn.Linear(d_model, out_dim)
         self.start_token = nn.Parameter(torch.zeros(1, 1, out_dim))
+        self.criterion = criterion
 
     def forward(self, cond, y_prev):
         B, L, _ = y_prev.shape
@@ -233,14 +265,14 @@ class TransformerCondDecoder(nn.Module):
         h = self.decoder(tgt=tgt, memory=mem, tgt_mask=tgt_mask)  # [B, L, d_model]
         return self.out_head(h)                            # [B, L, 2]
 
-    def train(self, batch_X, batch_y):
+    def train(self, batch_X, batch_y, model):
         B, C, L = batch_y.shape
         target  = batch_y.permute(0,2,1)
         start = model.start_token.expand(B, 1, C).to(batch_y.device)
         y_prev = torch.cat([start, target[:, :-1, :]], dim=1)
         preds = model(batch_X, y_prev)
-        loss = criterion(preds, target)
-        return loss()
+        loss = self.criterion(preds, target)
+        return loss
 
     def generate(self, cond, L=None):
         self.eval()
@@ -273,3 +305,5 @@ class TransformerCondDecoder(nn.Module):
         bank = scaler_y.inverse_transform(bank_scaled)[0].tolist()
 
         return alpha, bank
+
+        
